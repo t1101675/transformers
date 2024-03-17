@@ -726,10 +726,6 @@ class SwitchTransformersModelTest(ModelTesterMixin, GenerationTesterMixin, Pipel
     def test_disk_offload(self):
         pass
 
-    @unittest.skip("Test does not fail individually but fails on the CI @ArthurZucker looking into it")
-    def test_assisted_decoding_sample(self):
-        pass
-
 
 class SwitchTransformersEncoderOnlyModelTester:
     def __init__(
@@ -905,6 +901,7 @@ class SwitchTransformerRouterTest(unittest.TestCase):
     Original implementation of the routers here:
 
     """
+
     config = SwitchTransformersConfig(
         num_experts=2,
         hidden_size=8,
@@ -1068,7 +1065,7 @@ class SwitchTransformerModelIntegrationTests(unittest.TestCase):
         model = SwitchTransformersForConditionalGeneration.from_pretrained(
             "google/switch-base-8", torch_dtype=torch.bfloat16
         ).eval()
-        tokenizer = AutoTokenizer.from_pretrained("t5-small", use_fast=False, legacy=False)
+        tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small", use_fast=False, legacy=False)
         model = model.to(torch_device)
 
         input_ids = tokenizer(
@@ -1096,7 +1093,7 @@ class SwitchTransformerModelIntegrationTests(unittest.TestCase):
         model = SwitchTransformersForConditionalGeneration.from_pretrained(
             "google/switch-base-8", torch_dtype=torch.bfloat16
         ).eval()
-        tokenizer = AutoTokenizer.from_pretrained("t5-small", use_fast=False, legacy=False)
+        tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small", use_fast=False, legacy=False)
 
         inputs = [
             "A <extra_id_0> walks into a bar and orders a <extra_id_1> with <extra_id_2> pinch of <extra_id_3>."

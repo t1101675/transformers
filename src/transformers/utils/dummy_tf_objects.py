@@ -128,10 +128,6 @@ class TFTopPLogitsWarper(metaclass=DummyObject):
         requires_backends(self, ["tf"])
 
 
-def tf_top_k_top_p_filtering(*args, **kwargs):
-    requires_backends(tf_top_k_top_p_filtering, ["tf"])
-
-
 class KerasMetricCallback(metaclass=DummyObject):
     _backends = ["tf"]
 
@@ -1069,6 +1065,51 @@ class TFDeiTModel(metaclass=DummyObject):
 
 
 class TFDeiTPreTrainedModel(metaclass=DummyObject):
+    _backends = ["tf"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["tf"])
+
+
+TF_TRANSFO_XL_PRETRAINED_MODEL_ARCHIVE_LIST = None
+
+
+class TFAdaptiveEmbedding(metaclass=DummyObject):
+    _backends = ["tf"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["tf"])
+
+
+class TFTransfoXLForSequenceClassification(metaclass=DummyObject):
+    _backends = ["tf"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["tf"])
+
+
+class TFTransfoXLLMHeadModel(metaclass=DummyObject):
+    _backends = ["tf"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["tf"])
+
+
+class TFTransfoXLMainLayer(metaclass=DummyObject):
+    _backends = ["tf"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["tf"])
+
+
+class TFTransfoXLModel(metaclass=DummyObject):
+    _backends = ["tf"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["tf"])
+
+
+class TFTransfoXLPreTrainedModel(metaclass=DummyObject):
     _backends = ["tf"]
 
     def __init__(self, *args, **kwargs):
@@ -2613,51 +2654,6 @@ class TFTapasPreTrainedModel(metaclass=DummyObject):
         requires_backends(self, ["tf"])
 
 
-TF_TRANSFO_XL_PRETRAINED_MODEL_ARCHIVE_LIST = None
-
-
-class TFAdaptiveEmbedding(metaclass=DummyObject):
-    _backends = ["tf"]
-
-    def __init__(self, *args, **kwargs):
-        requires_backends(self, ["tf"])
-
-
-class TFTransfoXLForSequenceClassification(metaclass=DummyObject):
-    _backends = ["tf"]
-
-    def __init__(self, *args, **kwargs):
-        requires_backends(self, ["tf"])
-
-
-class TFTransfoXLLMHeadModel(metaclass=DummyObject):
-    _backends = ["tf"]
-
-    def __init__(self, *args, **kwargs):
-        requires_backends(self, ["tf"])
-
-
-class TFTransfoXLMainLayer(metaclass=DummyObject):
-    _backends = ["tf"]
-
-    def __init__(self, *args, **kwargs):
-        requires_backends(self, ["tf"])
-
-
-class TFTransfoXLModel(metaclass=DummyObject):
-    _backends = ["tf"]
-
-    def __init__(self, *args, **kwargs):
-        requires_backends(self, ["tf"])
-
-
-class TFTransfoXLPreTrainedModel(metaclass=DummyObject):
-    _backends = ["tf"]
-
-    def __init__(self, *args, **kwargs):
-        requires_backends(self, ["tf"])
-
-
 class TFVisionEncoderDecoderModel(metaclass=DummyObject):
     _backends = ["tf"]
 
@@ -2993,10 +2989,3 @@ class WarmUp(metaclass=DummyObject):
 
 def create_optimizer(*args, **kwargs):
     requires_backends(create_optimizer, ["tf"])
-
-
-class TFTrainer(metaclass=DummyObject):
-    _backends = ["tf"]
-
-    def __init__(self, *args, **kwargs):
-        requires_backends(self, ["tf"])

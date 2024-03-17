@@ -510,6 +510,7 @@ class ChineseCLIPModelTester:
         self.parent = parent
         self.text_model_tester = ChineseCLIPTextModelTester(parent, **text_kwargs)
         self.vision_model_tester = ChineseCLIPVisionModelTester(parent, **vision_kwargs)
+        self.batch_size = self.text_model_tester.batch_size  # need bs for batching_equivalence test
         self.is_training = is_training
 
     def prepare_config_and_inputs(self):
@@ -714,9 +715,9 @@ class ChineseCLIPModelIntegrationTest(unittest.TestCase):
         processor = ChineseCLIPProcessor.from_pretrained(model_name)
 
         image = prepare_img()
-        inputs = processor(text=["杰尼龟", "妙蛙种子", "小火龙", "皮卡丘"], images=image, padding=True, return_tensors="pt").to(
-            torch_device
-        )
+        inputs = processor(
+            text=["杰尼龟", "妙蛙种子", "小火龙", "皮卡丘"], images=image, padding=True, return_tensors="pt"
+        ).to(torch_device)
 
         # forward pass
         with torch.no_grad():

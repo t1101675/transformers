@@ -1107,9 +1107,13 @@ class MistralModel(MistralPreTrainedModel):
                     mask_length = attention_mask.shape[-1]
                     padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
                     padding_mask = padding_mask == 0
-                    causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                    tmp = causal_mask[:, :, :, :mask_length].masked_fill(
                         padding_mask, min_dtype
                     )
+                    if mask_length < causal_mask.size(-1):
+                        causal_mask = torch.cat([tmp, causal_mask[:, :, :, mask_length:]], dim=-1)
+                    else:
+                        causal_mask = tmp
 
         if (
             self.config._attn_implementation == "sdpa"

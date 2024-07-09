@@ -185,14 +185,14 @@ class XGLMSinusoidalPositionalEmbedding(nn.Module):
     @torch.no_grad()
     def forward(self, position_ids: torch.Tensor = None, past_key_values_length: int = 0):
         bsz, seq_len = position_ids.size()
-        position_ids += self.offset
+        _position_ids = position_ids + self.offset
 
         # Expand embeddings if needed. `position_ids.max()` is NOT used to keep torch.fx compatibility.
         max_pos = 2 + seq_len + past_key_values_length
         if max_pos > self.weights.size(0):
             self.make_weights(max_pos, self.embedding_dim, self.padding_idx)
 
-        return self.weights.index_select(0, position_ids.view(-1)).view(bsz, seq_len, self.weights.shape[-1]).detach()
+        return self.weights.index_select(0, _position_ids.view(-1)).view(bsz, seq_len, self.weights.shape[-1]).detach()
 
 
 class XGLMAttention(nn.Module):
@@ -279,15 +279,19 @@ class XGLMAttention(nn.Module):
             # if encoder bi-directional self-attention `past_key_value` is always `None`
             past_key_value = (key_states, value_states)
 
-        if self.use_memory_efficient_attention and self.training:
+        if self.use_memory_efficient_attention:
             attn_weights = None
             query_states = self._shape(query_states, tgt_len, bsz).transpose(1, 2)
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
-            attn_output = xops.memory_efficient_attention(
-                query_states, key_states, value_states, attn_bias=xops.LowerTriangularMask(), p=self.dropout, scale=1
-            )
-            
+            if self.training:
+                attn_output = xops.memory_efficient_attention(
+                    query_states, key_states, value_states, attn_bias=xops.LowerTriangularMask(), p=self.dropout, scale=1
+                )
+            else:
+                attn_output = xops.memory_efficient_attention(
+                    query_states, key_states, value_states, attn_bias=xops.LowerTriangularMask(), p=0, scale=1
+                )
             attn_output = attn_output.transpose(1, 2).contiguous().view(bsz * self.num_heads, tgt_len, self.head_dim)
             attn_weights_reshaped = None
         else:
@@ -593,13 +597,15 @@ class XGLMModel(XGLMPreTrainedModel):
         past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
 
         if position_ids is None:
-            position_ids = torch.arange(
+            _position_ids = torch.arange(
                 past_key_values_length,
                 input_shape[-1] + past_key_values_length,
                 dtype=torch.long,
                 device=input_ids.device if input_ids is not None else inputs_embeds.device,
             )
-            position_ids = position_ids.unsqueeze(0)
+            _position_ids = _position_ids.unsqueeze(0)
+        else:
+            _position_ids = position_ids
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -615,8 +621,8 @@ class XGLMModel(XGLMPreTrainedModel):
                 encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
             )
 
-        hidden_states = inputs_embeds + self.embed_positions(position_ids, past_key_values_length)
-        hidden_states = nn.functional.dropout(hidden_states, p=float(self.dropout), training=self.training)
+        hidden_states = inputs_embeds + self.embed_positions(_position_ids, past_key_values_length)
+        # hidden_states = nn.functional.dropout(hidden_states, p=float(self.dropout), training=self.training)
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -644,10 +650,10 @@ class XGLMModel(XGLMPreTrainedModel):
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            if self.training:
-                dropout_probability = torch.rand([])
-                if dropout_probability < self.layerdrop:
-                    continue
+            # if self.training:
+            #     dropout_probability = torch.rand([])
+            #     if dropout_probability < self.layerdrop:
+            #         continue
 
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
@@ -695,19 +701,19 @@ class XGLMModel(XGLMPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None
-        if not return_dict:
-            return tuple(
-                v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_cross_attentions]
-                if v is not None
-            )
+        # next_cache = next_decoder_cache if use_cache else None
+        # if not return_dict:
+        #     return tuple(
+        #         v
+        #         for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_cross_attentions]
+        #         if v is not None
+        #     )
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-            cross_attentions=all_cross_attentions,
+            # past_key_values=next_cache,
+            # hidden_states=all_hidden_states,
+            # attentions=all_self_attns,
+            # cross_attentions=all_cross_attentions,
         )
 
 

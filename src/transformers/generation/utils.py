@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 import torch
 import torch.distributed as dist
 from torch import nn
+import numpy as np
+from copy import deepcopy
 
 from ..cache_utils import (
     Cache,
@@ -1527,6 +1529,10 @@ class GenerationMixin:
         streamer: Optional["BaseStreamer"] = None,
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+        amateur_model = None,
+        amateur_alpha = None,
+        amateur_beta = None,
+
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         r"""
@@ -1876,6 +1882,9 @@ class GenerationMixin:
                 generation_config=generation_config,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
+                amateur_model=amateur_model,
+                amateur_alpha=amateur_alpha,
+                amateur_beta=amateur_beta,
                 **model_kwargs,
             )
 
@@ -2500,6 +2509,9 @@ class GenerationMixin:
         synced_gpus: bool,
         streamer: Optional["BaseStreamer"],
         logits_warper: Optional[LogitsProcessorList] = None,
+        amateur_model = None,
+        amateur_alpha = None,
+        amateur_beta = None,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         r"""
@@ -2573,9 +2585,13 @@ class GenerationMixin:
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
 
+        amateur_model_kwargs = deepcopy(model_kwargs)
+        
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if amateur_model is not None:
+                amateur_model_inputs = self.prepare_inputs_for_generation(input_ids, **amateur_model_kwargs)
 
             # forward pass to get next token
             outputs = self(
@@ -2584,11 +2600,25 @@ class GenerationMixin:
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
             )
+            
+            if amateur_model is not None:
+                amateur_outputs = amateur_model(
+                    **amateur_model_inputs,
+                    return_dict=True,
+                    output_attentions=False,
+                    output_hidden_states=False
+                )
 
             if synced_gpus and this_peer_finished:
                 continue  # don't waste resources running the code we don't need
 
             next_token_logits = outputs.logits[:, -1, :]
+            
+            if amateur_model is not None:
+                amateur_logits = amateur_outputs.logits[:, -1, :]
+                cutoff = np.log(amateur_alpha) + next_token_logits.max(dim=-1, keepdim=True).values
+                diffs = (1 + amateur_beta) * next_token_logits - amateur_beta * amateur_logits
+                next_token_logits = diffs.masked_fill(next_token_logits < cutoff, -float('inf'))
 
             # pre-process distribution
             next_token_scores = logits_processor(input_ids, next_token_logits)
@@ -2635,6 +2665,13 @@ class GenerationMixin:
                 model_kwargs,
                 is_encoder_decoder=self.config.is_encoder_decoder,
             )
+            
+            if amateur_model is not None:
+                amateur_model_kwargs = self._update_model_kwargs_for_generation(
+                    amateur_outputs,
+                    amateur_model_kwargs,
+                    is_encoder_decoder=self.config.is_encoder_decoder,
+                )
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
             this_peer_finished = unfinished_sequences.max() == 0

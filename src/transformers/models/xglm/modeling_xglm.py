@@ -748,6 +748,9 @@ class XGLMForCausalLM(XGLMPreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def set_force_gradient_checkpointing(self, value):
+        self.transformer.force_gradient_checkpointing = value
+
     @add_start_docstrings_to_model_forward(XGLM_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,

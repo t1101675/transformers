@@ -1268,6 +1268,9 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
         return model_inputs
 
+    def set_force_gradient_checkpointing(self, value):
+        self.transformer.force_gradient_checkpointing = value
+
     @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,

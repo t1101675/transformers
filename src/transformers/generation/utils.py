@@ -103,6 +103,10 @@ from .stopping_criteria import (
     StopStringCriteria,
 )
 
+try:
+    from .. import mpu
+except ImportError:
+    mpu = None
 
 if TYPE_CHECKING:
     from ..modeling_utils import PreTrainedModel
@@ -1532,7 +1536,8 @@ class GenerationMixin:
         amateur_model = None,
         amateur_alpha = None,
         amateur_beta = None,
-
+        mix_in_model = None,
+        mix_in_alpha = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         r"""
@@ -1885,6 +1890,8 @@ class GenerationMixin:
                 amateur_model=amateur_model,
                 amateur_alpha=amateur_alpha,
                 amateur_beta=amateur_beta,
+                mix_in_model=mix_in_model,
+                mix_in_alpha=mix_in_alpha,
                 **model_kwargs,
             )
 
@@ -2512,6 +2519,8 @@ class GenerationMixin:
         amateur_model = None,
         amateur_alpha = None,
         amateur_beta = None,
+        mix_in_model=None,
+        mix_in_alpha=None,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         r"""
@@ -2586,12 +2595,17 @@ class GenerationMixin:
         model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
 
         amateur_model_kwargs = deepcopy(model_kwargs)
-        
+        if mix_in_model is not None:
+            m_model_kwargs = deepcopy(model_kwargs)
+            
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             if amateur_model is not None:
                 amateur_model_inputs = self.prepare_inputs_for_generation(input_ids, **amateur_model_kwargs)
+
+            if mix_in_model is not None:
+                m_model_inputs = self.prepare_inputs_for_generation(input_ids, **m_model_kwargs)
 
             # forward pass to get next token
             outputs = self(
@@ -2620,10 +2634,24 @@ class GenerationMixin:
                 diffs = (1 + amateur_beta) * next_token_logits - amateur_beta * amateur_logits
                 next_token_logits = diffs.masked_fill(next_token_logits < cutoff, -float('inf'))
 
-            # pre-process distribution
-            next_token_scores = logits_processor(input_ids, next_token_logits)
-            if do_sample:
-                next_token_scores = logits_warper(input_ids, next_token_scores)
+            if hasattr(self.config, "is_model_parallel") and self.config.is_model_parallel:
+                gathered_next_token_logits = mpu.all_gather(
+                    next_token_logits.contiguous(),
+                    dim=-1,
+                    world_size=mpu.get_model_parallel_world_size(),
+                    group=mpu.get_model_parallel_group())
+                # pre-process distribution
+                full_next_token_scores = logits_processor(input_ids, gathered_next_token_logits)
+                if do_sample:
+                    full_next_token_scores = logits_warper(input_ids, full_next_token_scores)
+                    probs = nn.functional.softmax(full_next_token_scores.float(), dim=-1)
+                partition_size = full_next_token_scores.size(-1) // mpu.get_model_parallel_world_size()
+                next_token_scores = full_next_token_scores[:, mpu.get_model_parallel_rank()*partition_size:(mpu.get_model_parallel_rank()+1)*partition_size]
+            else:
+                next_token_scores = logits_processor(input_ids, next_token_logits)
+                if do_sample:
+                    next_token_scores = logits_warper(input_ids, next_token_logits)
+                    probs = nn.functional.softmax(next_token_scores.float(), dim=-1)
 
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
@@ -2647,10 +2675,42 @@ class GenerationMixin:
 
             # token selection
             if do_sample:
-                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                # mix in model forward pass
+                if mix_in_model is not None:
+                    m_outputs = mix_in_model(
+                        **m_model_inputs,
+                        return_dict=True,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                    )
+                    
+                    m_next_token_logits = m_outputs.logits[:, -1, :]
+                    
+                    if hasattr(self.config, "is_model_parallel") and self.config.is_model_parallel:
+                        gathered_m_next_token_logits = mpu.all_gather(
+                            m_next_token_logits.contiguous(),
+                            dim=-1,
+                            world_size=mpu.get_model_parallel_world_size(),
+                            group=mpu.get_model_parallel_group())
+                        m_next_token_scores = logits_processor(input_ids, gathered_m_next_token_logits)
+                        m_next_token_scores = logits_warper(input_ids, m_next_token_scores)
+                        m_probs = nn.functional.softmax(m_next_token_scores.float(), dim=-1)
+                        partition_size = m_next_token_scores.size(-1) // mpu.get_model_parallel_world_size()
+                        m_next_token_scores = m_next_token_scores[:, mpu.get_model_parallel_rank()*partition_size:(mpu.get_model_parallel_rank()+1)*partition_size]
+                    else:
+                        m_next_token_scores = logits_processor(input_ids, m_next_token_logits)
+                        m_next_token_scores = logits_warper(input_ids, m_next_token_scores)
+                        m_probs = nn.functional.softmax(m_next_token_scores.float(), dim=-1)
+                
+                    probs = (1 - mix_in_alpha) * probs + mix_in_alpha * m_probs
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
-                next_tokens = torch.argmax(next_token_scores, dim=-1)
+                assert mix_in_model is None
+                if hasattr(self.config, "is_model_parallel") and self.config.is_model_parallel:
+                    next_tokens = torch.argmax(full_next_token_scores, dim=-1)
+
+            if hasattr(self.config, "is_model_parallel") and self.config.is_model_parallel:
+                dist.broadcast(next_tokens, src=mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
 
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
@@ -2671,6 +2731,11 @@ class GenerationMixin:
                     amateur_outputs,
                     amateur_model_kwargs,
                     is_encoder_decoder=self.config.is_encoder_decoder,
+                )
+
+            if mix_in_model is not None:
+                m_model_kwargs = self._update_model_kwargs_for_generation(
+                    m_outputs, m_model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
                 )
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)

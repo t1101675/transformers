@@ -2708,6 +2708,8 @@ class GenerationMixin:
                 assert mix_in_model is None
                 if hasattr(self.config, "is_model_parallel") and self.config.is_model_parallel:
                     next_tokens = torch.argmax(full_next_token_scores, dim=-1)
+                else:
+                    next_tokens = torch.argmax(next_token_scores, dim=-1)
 
             if hasattr(self.config, "is_model_parallel") and self.config.is_model_parallel:
                 dist.broadcast(next_tokens, src=mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())

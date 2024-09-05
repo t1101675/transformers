@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
-from typing import TYPE_CHECKING, Any, Dict, List, Union
+from functools import cached_property
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from packaging import version
 
@@ -23,7 +24,13 @@ from .quantizers_utils import get_module_from_name
 if TYPE_CHECKING:
     from ..modeling_utils import PreTrainedModel
 
-from ..utils import is_accelerate_available, is_bitsandbytes_available, is_torch_available, logging
+from ..utils import (
+    ACCELERATE_MIN_VERSION,
+    is_accelerate_available,
+    is_bitsandbytes_available,
+    is_torch_available,
+    logging,
+)
 
 
 if is_torch_available():
@@ -58,10 +65,15 @@ class Bnb4BitHfQuantizer(HfQuantizer):
             self.modules_to_not_convert = self.quantization_config.llm_int8_skip_modules
 
     def validate_environment(self, *args, **kwargs):
-        if not (is_accelerate_available() and is_bitsandbytes_available()):
+        if not torch.cuda.is_available():
+            raise RuntimeError("No GPU found. A GPU is needed for quantization.")
+        if not is_accelerate_available():
             raise ImportError(
-                "Using `bitsandbytes` 8-bit quantization requires Accelerate: `pip install accelerate` "
-                "and the latest version of bitsandbytes: `pip install -i https://pypi.org/simple/ bitsandbytes`"
+                f"Using `bitsandbytes` 4-bit quantization requires Accelerate: `pip install 'accelerate>={ACCELERATE_MIN_VERSION}'`"
+            )
+        if not is_bitsandbytes_available():
+            raise ImportError(
+                "Using `bitsandbytes` 4-bit quantization requires the latest version of bitsandbytes: `pip install -U bitsandbytes`"
             )
 
         if kwargs.get("from_tf", False) or kwargs.get("from_flax", False):
@@ -69,9 +81,6 @@ class Bnb4BitHfQuantizer(HfQuantizer):
                 "Converting into 4-bit or 8-bit weights from tf/flax weights is currently not supported, please make"
                 " sure the weights are in PyTorch format."
             )
-
-        if not torch.cuda.is_available():
-            raise RuntimeError("No GPU found. A GPU is needed for quantization.")
 
         device_map = kwargs.get("device_map", None)
         if (
@@ -84,14 +93,12 @@ class Bnb4BitHfQuantizer(HfQuantizer):
             }
             if "cpu" in device_map_without_lm_head.values() or "disk" in device_map_without_lm_head.values():
                 raise ValueError(
-                    """
-                    Some modules are dispatched on the CPU or the disk. Make sure you have enough GPU RAM to fit the
-                    quantized model. If you want to dispatch the model on the CPU or the disk while keeping these modules
-                    in 32-bit, you need to set `load_in_8bit_fp32_cpu_offload=True` and pass a custom `device_map` to
-                    `from_pretrained`. Check
-                    https://huggingface.co/docs/transformers/main/en/main_classes/quantization#offload-between-cpu-and-gpu
-                    for more details.
-                    """
+                    "Some modules are dispatched on the CPU or the disk. Make sure you have enough GPU RAM to fit the "
+                    "quantized model. If you want to dispatch the model on the CPU or the disk while keeping these modules "
+                    "in 32-bit, you need to set `load_in_8bit_fp32_cpu_offload=True` and pass a custom `device_map` to "
+                    "`from_pretrained`. Check "
+                    "https://huggingface.co/docs/transformers/main/en/main_classes/quantization#offload-between-cpu-and-gpu "
+                    "for more details. "
                 )
 
         if version.parse(importlib.metadata.version("bitsandbytes")) < version.parse("0.39.0"):
@@ -143,7 +150,7 @@ class Bnb4BitHfQuantizer(HfQuantizer):
         param_name: str,
         target_device: "torch.device",
         state_dict: Dict[str, Any],
-        unexpected_keys: List[str],
+        unexpected_keys: Optional[List[str]] = None,
     ):
         """
         combines logic from _load_state_dict_into_meta_model and .integrations.bitsandbytes.py::set_module_quantized_tensor_to_device()
@@ -198,13 +205,19 @@ class Bnb4BitHfQuantizer(HfQuantizer):
             for k, v in state_dict.items():
                 if param_name + "." in k:
                     quantized_stats[k] = v
-                    unexpected_keys.remove(k)
+                    if unexpected_keys is not None and k in unexpected_keys:
+                        unexpected_keys.remove(k)
+
+            param_kwargs = {}
+            if self.is_bnb_supports_quant_storage_module:
+                param_kwargs["module"] = module
 
             new_value = bnb.nn.Params4bit.from_prequantized(
                 data=param_value,
                 quantized_stats=quantized_stats,
                 requires_grad=False,
                 device=target_device,
+                **param_kwargs,
             )
         else:
             new_value = param_value.to("cpu")
@@ -311,6 +324,23 @@ class Bnb4BitHfQuantizer(HfQuantizer):
 
         return True
 
+    @cached_property
+    def is_bnb_supports_quant_storage_module(self) -> bool:
+        """
+        determines if the current version of bitsandbytes supports
+        the `module` parameter in `Params4bit.from_prequantized`
+        :return:
+        """
+        return version.parse(importlib.metadata.version("bitsandbytes")) >= version.parse("0.43.3")
+
     @property
     def is_trainable(self) -> bool:
         return True
+
+    def _dequantize(self, model):
+        from ..integrations import dequantize_and_replace
+
+        model = dequantize_and_replace(
+            model, self.modules_to_not_convert, quantization_config=self.quantization_config
+        )
+        return model

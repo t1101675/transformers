@@ -37,6 +37,12 @@ _CHECKPOINT_FOR_DOC = "facebook/xglm-564M"
 _CONFIG_FOR_DOC = "XGLMConfig"
 
 
+try:
+    from xformers import ops as xops
+except ImportError:
+    xops = None
+
+
 XGLM_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
@@ -180,14 +186,14 @@ class XGLMSinusoidalPositionalEmbedding(nn.Module):
     @torch.no_grad()
     def forward(self, position_ids: torch.Tensor = None, past_key_values_length: int = 0):
         bsz, seq_len = position_ids.size()
-        position_ids += self.offset
+        _position_ids = position_ids + self.offset
 
         # Expand embeddings if needed. `position_ids.max()` is NOT used to keep torch.fx compatibility.
         max_pos = 2 + seq_len + past_key_values_length
         if max_pos > self.weights.size(0):
             self.make_weights(max_pos, self.embedding_dim, self.padding_idx)
 
-        return self.weights.index_select(0, position_ids.view(-1)).view(bsz, seq_len, self.weights.shape[-1]).detach()
+        return self.weights.index_select(0, _position_ids.view(-1)).view(bsz, seq_len, self.weights.shape[-1]).detach()
 
 
 class XGLMAttention(nn.Module):
@@ -200,12 +206,14 @@ class XGLMAttention(nn.Module):
         dropout: float = 0.0,
         is_decoder: bool = False,
         bias: bool = True,
+        use_memory_efficient_attention: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout = dropout
         self.head_dim = embed_dim // num_heads
+        self.use_memory_efficient_attention = use_memory_efficient_attention
 
         if (self.head_dim * num_heads) != self.embed_dim:
             raise ValueError(
@@ -272,59 +280,75 @@ class XGLMAttention(nn.Module):
             # if encoder bi-directional self-attention `past_key_value` is always `None`
             past_key_value = (key_states, value_states)
 
-        proj_shape = (bsz * self.num_heads, -1, self.head_dim)
-        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
-        key_states = key_states.view(*proj_shape)
-        value_states = value_states.view(*proj_shape)
-
-        src_len = key_states.size(1)
-        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
-
-        if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+        if self.use_memory_efficient_attention:
+            attn_weights = None
+            query_states = self._shape(query_states, tgt_len, bsz).transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+            if self.training:
+                attn_output = xops.memory_efficient_attention(
+                    query_states, key_states, value_states, attn_bias=xops.LowerTriangularMask(), p=self.dropout, scale=1
                 )
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
-            attn_weights = torch.max(
-                attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-            )
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
-
-        # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
-        if attn_weights.dtype == torch.float16:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
-        else:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
-        if layer_head_mask is not None:
-            if layer_head_mask.size() != (self.num_heads,):
-                raise ValueError(
-                    f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
-                    f" {layer_head_mask.size()}"
+            else:
+                attn_output = xops.memory_efficient_attention(
+                    query_states, key_states, value_states, attn_bias=xops.LowerTriangularMask(), p=0, scale=1
                 )
-            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
-
-        if output_attentions:
-            # this operation is a bit awkward, but it's required to
-            # make sure that attn_weights keeps its gradient.
-            # In order to do so, attn_weights have to be reshaped
-            # twice and have to be reused in the following
-            attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
-        else:
+            attn_output = attn_output.transpose(1, 2).contiguous().view(bsz * self.num_heads, tgt_len, self.head_dim)
             attn_weights_reshaped = None
+        else:
+            proj_shape = (bsz * self.num_heads, -1, self.head_dim)
+            query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
+            key_states = key_states.view(*proj_shape)
+            value_states = value_states.view(*proj_shape)
 
-        attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+            src_len = key_states.size(1)
+            attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
-        attn_output = torch.bmm(attn_probs, value_states)
+            if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
+                    f" {attn_weights.size()}"
+                )
+
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    )
+                attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
+                attn_weights = torch.max(
+                    attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+                )
+                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+            # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
+            if attn_weights.dtype == torch.float16:
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
+            else:
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+            if layer_head_mask is not None:
+                if layer_head_mask.size() != (self.num_heads,):
+                    raise ValueError(
+                        f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
+                        f" {layer_head_mask.size()}"
+                    )
+                attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+            if output_attentions:
+                # this operation is a bit awkward, but it's required to
+                # make sure that attn_weights keeps its gradient.
+                # In order to do so, attn_weights have to be reshaped
+                # twice and have to be reused in the following
+                attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
+            else:
+                attn_weights_reshaped = None
+
+            attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+
+            attn_output = torch.bmm(attn_probs, value_states)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -354,6 +378,7 @@ class XGLMDecoderLayer(nn.Module):
             num_heads=config.attention_heads,
             dropout=config.attention_dropout,
             is_decoder=True,
+            use_memory_efficient_attention=getattr(config, "use_memory_efficient_attention", False),
         )
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
@@ -365,6 +390,7 @@ class XGLMDecoderLayer(nn.Module):
                 num_heads=config.attention_heads,
                 dropout=config.attention_dropout,
                 is_decoder=True,
+                use_memory_efficient_attention=getattr(config, "use_memory_efficient_attention", False),
             )
             self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
 
@@ -572,13 +598,15 @@ class XGLMModel(XGLMPreTrainedModel):
         past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
 
         if position_ids is None:
-            position_ids = torch.arange(
+            _position_ids = torch.arange(
                 past_key_values_length,
                 input_shape[-1] + past_key_values_length,
                 dtype=torch.long,
                 device=input_ids.device if input_ids is not None else inputs_embeds.device,
             )
-            position_ids = position_ids.unsqueeze(0)
+            _position_ids = _position_ids.unsqueeze(0)
+        else:
+            _position_ids = position_ids
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -594,8 +622,8 @@ class XGLMModel(XGLMPreTrainedModel):
                 encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
             )
 
-        hidden_states = inputs_embeds + self.embed_positions(position_ids, past_key_values_length)
-        hidden_states = nn.functional.dropout(hidden_states, p=float(self.dropout), training=self.training)
+        hidden_states = inputs_embeds + self.embed_positions(_position_ids, past_key_values_length)
+        # hidden_states = nn.functional.dropout(hidden_states, p=float(self.dropout), training=self.training)
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -623,10 +651,10 @@ class XGLMModel(XGLMPreTrainedModel):
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            if self.training:
-                dropout_probability = torch.rand([])
-                if dropout_probability < self.layerdrop:
-                    continue
+            # if self.training:
+            #     dropout_probability = torch.rand([])
+            #     if dropout_probability < self.layerdrop:
+            #         continue
 
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
@@ -674,19 +702,19 @@ class XGLMModel(XGLMPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None
-        if not return_dict:
-            return tuple(
-                v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_cross_attentions]
-                if v is not None
-            )
+        # next_cache = next_decoder_cache if use_cache else None
+        # if not return_dict:
+        #     return tuple(
+        #         v
+        #         for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_cross_attentions]
+        #         if v is not None
+        #     )
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-            cross_attentions=all_cross_attentions,
+            # past_key_values=next_cache,
+            # hidden_states=all_hidden_states,
+            # attentions=all_self_attns,
+            # cross_attentions=all_cross_attentions,
         )
 
 
@@ -720,6 +748,9 @@ class XGLMForCausalLM(XGLMPreTrainedModel, GenerationMixin):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def set_force_gradient_checkpointing(self, value):
+        self.transformer.force_gradient_checkpointing = value
 
     @add_start_docstrings_to_model_forward(XGLM_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(

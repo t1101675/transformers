@@ -31,6 +31,13 @@ _import_structure = {
     "tokenization_gpt2": ["GPT2Tokenizer"],
 }
 
+# ### MiniLLM BEGIN ###
+_import_structure["mp_utils_gpt2"] = [
+    "decrease_mp_gpt2",
+    "increase_mp_gpt2",
+]
+# ### MiniLLM END ###
+
 try:
     if not is_tokenizers_available():
         raise OptionalDependencyNotAvailable()
@@ -115,6 +122,12 @@ if TYPE_CHECKING:
             GPT2PreTrainedModel,
             load_tf_weights_in_gpt2,
         )
+        # ### MiniLLM BEGIN ###
+        from .mp_utils_gpt2 import (
+            increase_mp_gpt2,
+            decrease_mp_gpt2
+        )
+        # ### MiniLLM END ###
 
     try:
         if not is_tf_available():

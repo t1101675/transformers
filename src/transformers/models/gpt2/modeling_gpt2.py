@@ -53,6 +53,16 @@ from ...utils import (
 from ...utils.model_parallel_utils import assert_device_map, get_device_map
 from .configuration_gpt2 import GPT2Config
 
+# ### MiniLLM BEGIN ###
+import torch.nn.functional as F
+from ...mpu.initialize import get_model_parallel_world_size
+from ...mpu.initialize import get_model_parallel_rank
+from ...mpu.utils import divide
+from ...mpu import copy_to_model_parallel_region
+from ...mpu.layers import ColumnParallelLinear
+from ...mpu.layers import RowParallelLinear
+from ...mpu import VocabParallelEmbedding
+# ### MiniLLM END ###
 
 if is_flash_attn_2_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
@@ -151,14 +161,44 @@ class GPT2Attention(nn.Module):
         self.scale_attn_by_inverse_layer_idx = config.scale_attn_by_inverse_layer_idx
         self.layer_idx = layer_idx
         self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.world_size = get_model_parallel_world_size() # p
+            embed_dim_full = self.embed_dim
+            self.embed_dim_per_partition = divide(embed_dim_full, self.world_size) # h_p
+            self.num_heads_per_partition = divide(self.num_heads, self.world_size) # n_p
 
-        if self.is_cross_attention:
-            self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
-            self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
+            if self.is_cross_attention:
+                self.c_attn = ColumnParallelLinear(self.embed_dim,
+                                                2 * self.embed_dim,
+                                                stride=2,  # NOTE: modify stride
+                                                bias=True,
+                                                gather_output=False)
+                self.q_attn = ColumnParallelLinear(self.embed_dim,
+                                                self.embed_dim,
+                                                stride=2,  # NOTE: modify stride
+                                                bias=True,
+                                                gather_output=False)
+            else:
+                self.c_attn = ColumnParallelLinear(self.embed_dim,
+                                                3 * self.embed_dim,
+                                                stride=3,  # NOTE: modify stride
+                                                bias=True,
+                                                gather_output=False)
+
+            self.c_proj = RowParallelLinear(self.embed_dim,
+                                            self.embed_dim,
+                                            input_is_parallel=True,
+                                            bias=True)
         else:
-            self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
-        self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
-
+            if self.is_cross_attention:
+                self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
+                self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
+            else:
+                self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+            self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
+        # ### MiniLLM END ###
+        
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
         self.is_causal = True
@@ -206,7 +246,7 @@ class GPT2Attention(nn.Module):
             # Apply the attention mask
             attn_weights = attn_weights + attention_mask
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
 
         # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
         attn_weights = attn_weights.type(value.dtype)
@@ -566,8 +606,24 @@ class GPT2MLP(nn.Module):
     def __init__(self, intermediate_size, config):
         super().__init__()
         embed_dim = config.hidden_size
-        self.c_fc = Conv1D(intermediate_size, embed_dim)
-        self.c_proj = Conv1D(embed_dim, intermediate_size)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.c_fc = ColumnParallelLinear(
+                embed_dim,
+                intermediate_size,
+                gather_output=False,
+                bias=True,
+            )
+            self.c_proj = RowParallelLinear(
+                intermediate_size,
+                embed_dim,
+                bias=True,
+                input_is_parallel=True,
+            )
+        else:
+            self.c_fc = Conv1D(intermediate_size, embed_dim)
+            self.c_proj = Conv1D(embed_dim, intermediate_size)
+        # ### MiniLLM END ###
         self.act = ACT2FN[config.activation_function]
         self.dropout = nn.Dropout(config.resid_pdrop)
 
@@ -897,7 +953,12 @@ class GPT2Model(GPT2PreTrainedModel):
 
         self.embed_dim = config.hidden_size
 
-        self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
+        else:
+            self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
+        # ### MiniLLM END ###
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
@@ -909,6 +970,9 @@ class GPT2Model(GPT2PreTrainedModel):
         self.device_map = None
         self.gradient_checkpointing = False
         self._attn_implementation = config._attn_implementation
+        # ### MiniLLM BEGIN ###
+        self.force_gradient_checkpointing = False
+        # ### MiniLLM END ###
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1090,7 +1154,10 @@ class GPT2Model(GPT2PreTrainedModel):
 
         output_shape = (-1,) + input_shape[1:] + (hidden_states.size(-1),)
 
-        if self.gradient_checkpointing and self.training:
+        # ### MiniLLM BEGIN ###
+        # Gradient checkpointing in the model.eval() mode for PPO training
+        if self.force_gradient_checkpointing or (self.gradient_checkpointing and self.training):
+        # ### MiniLLM END ###
             if use_cache:
                 logger.warning_once(
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
@@ -1116,7 +1183,9 @@ class GPT2Model(GPT2PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
+            # ### MiniLLM BEGIN ###
+            if self.force_gradient_checkpointing or (self.gradient_checkpointing and self.training):
+            # ### MiniLLM END ###
                 outputs = self._gradient_checkpointing_func(
                     block.__call__,
                     hidden_states,
@@ -1191,11 +1260,26 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.transformer = GPT2Model(config)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.lm_head = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        else:
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # ### MiniLLM END ###
 
         # Model parallel
         self.model_parallel = False
         self.device_map = None
+
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            # HACK: for gpt2 vocabulary
+            partition_size = config.vocab_size // get_model_parallel_world_size()
+            self.logits_mask = torch.zeros(partition_size)
+            if get_model_parallel_rank() == get_model_parallel_world_size() - 1:
+                partition_start = 50257 - get_model_parallel_rank() * partition_size
+                self.logits_mask[partition_start:] = float("-inf")
+        # ### MiniLLM END ###
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1243,6 +1327,12 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         output_type=CausalLMOutputWithCrossAttentions,
         config_class=_CONFIG_FOR_DOC,
     )
+    
+    # ### MiniLLM BEGIN ###
+    def set_force_gradient_checkpointing(self, value):
+        self.transformer.force_gradient_checkpointing = value
+    # ### MiniLLM END ###
+    
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1290,7 +1380,16 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
             torch.cuda.set_device(self.transformer.first_device)
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
-        lm_logits = self.lm_head(hidden_states)
+        # ### MiniLLM BEGIN ###
+        if getattr(self.config, "is_model_parallel", False):
+            hidden_state_parallel = copy_to_model_parallel_region(hidden_states)
+            logits_parallel = F.linear(hidden_state_parallel, self.lm_head.weight)
+            
+            lm_logits = logits_parallel
+            lm_logits = lm_logits + self.logits_mask[None, None, :].to(lm_logits.device)
+        else:
+            lm_logits = self.lm_head(hidden_states)
+        # ### MiniLLM END ###
 
         loss = None
         if labels is not None:

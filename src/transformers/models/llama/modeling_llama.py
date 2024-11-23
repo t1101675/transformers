@@ -52,6 +52,16 @@ from ...utils import (
 )
 from .configuration_llama import LlamaConfig
 
+# ### MiniLLM BEGIN ###
+import torch.nn.functional as F
+from ...mpu.initialize import get_model_parallel_world_size
+from ...mpu.initialize import get_model_parallel_rank
+from ...mpu.utils import divide
+from ...mpu import copy_to_model_parallel_region
+from ...mpu.layers import ColumnParallelLinear
+from ...mpu.layers import RowParallelLinear
+from ...mpu import VocabParallelEmbedding
+# ### MiniLLM END ###
 
 logger = logging.get_logger(__name__)
 
@@ -234,13 +244,35 @@ class LlamaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.gate_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                gather_output=False,
+                bias=False,
+            )
+            self.down_proj = RowParallelLinear(
+                self.intermediate_size,
+                self.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+            )
+            self.up_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                gather_output=False,
+                bias=False,
+            )
+        else:
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         if self.config.pretraining_tp > 1:
+            assert not getattr(self.config, "is_model_parallel", False), "Model parallelism is not supported for pretraining_tp > 1"
             slice = self.intermediate_size // self.config.pretraining_tp
             gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
             up_proj_slices = self.up_proj.weight.split(slice, dim=0)
@@ -273,6 +305,33 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+# ### MiniLLM BEGIN ###
+class LoRA(nn.Module):
+    # LoRA that supports model parallelism
+    def __init__(self, in_dim, out_dim, lora_config):
+        super().__init__()
+        self.weight = ColumnParallelLinear(in_dim, out_dim,
+                                           stride=1,
+                                           bias=False,
+                                           gather_output=False)
+        self.lora_A = nn.Linear(in_dim, lora_config["r"], bias=False)
+        self.lora_B = ColumnParallelLinear(lora_config["r"], out_dim,
+                                           stride=1,
+                                           bias=False,
+                                           gather_output=False)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        if lora_config["dropout"] > 0.0:
+            self.lora_dropout_layer = nn.Dropout(p=lora_config["dropout"])
+        else:
+            self.lora_dropout_layer = nn.Identity()
+        self.scaling = lora_config["alpha"] / lora_config["r"]
+    
+    def forward(self, x):
+        result = self.weight(x) + self.lora_B(self.lora_A(self.lora_dropout_layer(x))) * self.scaling
+        return result
+# ### MiniLLM END ###
+
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -297,11 +356,43 @@ class LlamaAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
+        
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.world_size = get_model_parallel_world_size() # p
+            hidden_size_full = self.hidden_size
+            self.hidden_size = divide(self.hidden_size, self.world_size) # h_p
+            num_heads_full = self.num_heads
+            self.num_heads = divide(self.num_heads, self.world_size) # n_p
+            num_key_value_heads_full = self.num_key_value_heads
+            self.num_key_value_heads = divide(self.num_key_value_heads, self.world_size) # n_kv_p
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+            self.q_proj = ColumnParallelLinear(hidden_size_full,
+                                            num_heads_full * self.head_dim,
+                                            stride=1,
+                                            bias=config.attention_bias,
+                                            gather_output=False)
+            self.k_proj = ColumnParallelLinear(hidden_size_full,
+                                            num_key_value_heads_full * self.head_dim,
+                                            stride=1,
+                                            bias=config.attention_bias,
+                                            gather_output=False)
+            self.v_proj = ColumnParallelLinear(hidden_size_full,
+                                            num_key_value_heads_full * self.head_dim,
+                                            stride=1,
+                                            bias=config.attention_bias,
+                                            gather_output=False)
+
+            self.o_proj = RowParallelLinear(num_heads_full * self.head_dim,
+                                            hidden_size_full,
+                                            input_is_parallel=True,
+                                            bias=config.attention_bias)
+        else:
+            self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+            self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+            self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+            self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        # ### MiniLLM END ###
 
         # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
@@ -321,6 +412,7 @@ class LlamaAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         if self.config.pretraining_tp > 1:
+            assert not getattr(self.config, "is_model_parallel", False), "Model parallelism is not supported for pretraining_tp > 1"
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
                 (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
@@ -387,6 +479,7 @@ class LlamaAttention(nn.Module):
         attn_output = attn_output.reshape(bsz, q_len, -1)
 
         if self.config.pretraining_tp > 1:
+            assert not getattr(self.config, "is_model_parallel", False), "Model parallelism is not supported for pretraining_tp > 1"
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
@@ -843,14 +936,21 @@ class LlamaModel(LlamaPreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
+        else:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        # ### MiniLLM END ###
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        # ### MiniLLM BEGIN ###
+        self.force_gradient_checkpointing = False
+        # ### MiniLLM END ###
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -886,7 +986,10 @@ class LlamaModel(LlamaPreTrainedModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        if self.gradient_checkpointing and self.training and use_cache:
+        # ### MiniLLM BEGIN ###
+        # Gradient checkpointing in the model.eval() mode for PPO training
+        if self.force_gradient_checkpointing or (self.gradient_checkpointing and self.training and use_cache):
+        # ### MiniLLM END ###
             logger.warning_once(
                 "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
             )
@@ -933,8 +1036,10 @@ class LlamaModel(LlamaPreTrainedModel):
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
-            if self.gradient_checkpointing and self.training:
+            # ### MiniLLM BEGIN ###
+            # Gradient checkpointing in the model.eval() mode for PPO training
+            if self.force_gradient_checkpointing or (self.gradient_checkpointing and self.training):
+            # ### MiniLLM END ###
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -1118,7 +1223,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = LlamaModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.lm_head = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        else:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # ### MiniLLM END ###
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1140,6 +1250,47 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model
+
+    # ### MiniLLM BEGIN ###
+    def set_force_gradient_checkpointing(self, value):
+        self.model.force_gradient_checkpointing = value
+
+    def add_lora(self, lora_config):
+        # lora with model(tensor) parallelism
+        self.lora_config = lora_config
+        if lora_config.get("target_keys", None) is not None:
+            target_keys = lora_config.get("target_keys", None).split(",")
+        else:
+            target_keys = ["q_proj", "v_proj"]
+            
+        keys = [key for key, _ in self.named_modules()]
+        for key in keys:
+            if any([target_key in key for target_key in target_keys]):
+                old_module = self.get_submodule(key)
+                device = old_module.weight.device
+                out_dim, in_dim = old_module.weight.size()
+                parent = self.get_submodule(".".join(key.split(".")[:-1]))
+                target_key = key.split(".")[-1]
+                new_module = LoRA(in_dim, out_dim * get_model_parallel_world_size(), lora_config).to(device)
+                setattr(parent, target_key, new_module)
+                new_module.weight.weight = old_module.weight
+
+        for n, p in self.named_parameters():
+            if "lora" not in n:
+                p.requires_grad = False
+        
+        if self.is_gradient_checkpointing:
+            self.enable_input_require_grads()
+
+    def lora_state_dict(self):
+        keys = [key for key, _ in self.named_modules()]
+        lora_dict = {}
+        for key in keys:
+            if "lora" in key:
+                module = self.get_submodule(key)
+                lora_dict.update(module.state_dict(prefix=key + "."))
+        return lora_dict 
+    # ### MiniLLM END ###
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -1212,12 +1363,19 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
         hidden_states = outputs[0]
         if self.config.pretraining_tp > 1:
+            assert not getattr(self.config, "is_model_parallel", False), "Model parallelism is not supported for pretraining_tp > 1"
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-            logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+            # ### MiniLLM BEGIN ###
+            if getattr(self.config, "is_model_parallel", False):
+                hidden_states = copy_to_model_parallel_region(hidden_states)
+                logits = F.linear(hidden_states[:, -num_logits_to_keep:, :], self.lm_head.weight)
+            else:
+                logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+            # ### MiniLLM END ###
 
         loss = None
         if labels is not None:

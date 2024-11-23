@@ -103,6 +103,11 @@ from .stopping_criteria import (
     StopStringCriteria,
 )
 
+# ### MiniLLM BEGIN ###
+from copy import deepcopy
+from .. import mpu
+import torch.distributed as dist
+# ### MiniLLM END ###
 
 if TYPE_CHECKING:
     from ..modeling_utils import PreTrainedModel
@@ -1882,6 +1887,10 @@ class GenerationMixin:
         streamer: Optional["BaseStreamer"] = None,
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+        # ### MiniLLM BEGIN ###
+        mix_in_model = None,
+        mix_in_alpha = None,
+        # ### MiniLLM END ###
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         r"""
@@ -2224,6 +2233,10 @@ class GenerationMixin:
                 generation_config=generation_config,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
+                # ### MiniLLM BEGIN ###
+                mix_in_model=mix_in_model,
+                mix_in_alpha=mix_in_alpha,
+                # ### MiniLLM END ###
                 **model_kwargs,
             )
 
@@ -3132,6 +3145,10 @@ class GenerationMixin:
         generation_config: GenerationConfig,
         synced_gpus: bool,
         streamer: Optional["BaseStreamer"],
+        # ### MiniLLM BEGIN ###
+        mix_in_model=None,
+        mix_in_alpha=None,
+        # ### MiniLLM END ###
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         r"""
@@ -3197,12 +3214,18 @@ class GenerationMixin:
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
 
+        # ### MiniLLM BEGIN ###
+        if mix_in_model is not None:
+            assert "inputs_embeds" not in model_kwargs or model_kwargs["inputs_embeds"] is None, \
+                "The teacher-mix-in operation in MiniLLM does not support 'inputs_embeds' in model_kwargs."
+            m_model_kwargs = deepcopy(model_kwargs)
+        # ### MiniLLM END ###
+
         while self._has_unfinished_sequences(
             this_peer_finished, synced_gpus, device=input_ids.device, cur_len=cur_len, max_length=max_length
         ):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-
             # prepare variable output controls (note: some models won't accept all output controls)
             model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
             model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
@@ -3210,12 +3233,32 @@ class GenerationMixin:
             # forward pass to get next token
             outputs = self(**model_inputs, return_dict=True)
 
-            # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,
                 is_encoder_decoder=self.config.is_encoder_decoder,
             )
+            
+            # ### MiniLLM BEGIN ###  
+            if mix_in_model is not None:
+                m_model_inputs = self.prepare_inputs_for_generation(input_ids, **m_model_kwargs)
+
+                m_model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
+                m_model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
+
+                m_outputs = mix_in_model(
+                    **m_model_inputs,
+                    return_dict=True,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                )
+
+                m_model_kwargs = self._update_model_kwargs_for_generation(
+                    m_outputs, m_model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
+                )
+            # ### MiniLLLM END ###
+            
+            # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
             if synced_gpus and this_peer_finished:
                 continue
 
@@ -3224,13 +3267,46 @@ class GenerationMixin:
             next_token_logits = outputs.logits.clone()[:, -1, :].float()
             next_token_logits = next_token_logits.to(input_ids.device)
 
-            # pre-process distribution
-            next_token_scores = logits_processor(input_ids, next_token_logits)
+            # ### MiniLLM BEGIN ###
+            if getattr(self.config, "is_model_parallel", False):
+                gathered_next_token_logits = mpu.all_gather(
+                    next_token_logits.contiguous(),
+                    dim=-1,
+                    world_size=mpu.get_model_parallel_world_size(),
+                    group=mpu.get_model_parallel_group())
+                # pre-process distribution
+                next_token_scores = logits_processor(input_ids, gathered_next_token_logits)
+                partition_size = next_token_scores.size(-1) // mpu.get_model_parallel_world_size()
+                next_token_scores_return = next_token_scores[:, mpu.get_model_parallel_rank()*partition_size:(mpu.get_model_parallel_rank()+1)*partition_size]
+            else:
+                # pre-process distribution
+                next_token_scores = logits_processor(input_ids, next_token_logits)
+                next_token_scores_return = next_token_scores
+            # ### MiniLLM END ###
+            
+            # ### MiniLLM BEGIN ###
+            if mix_in_model is not None:
+                m_next_token_logits = m_outputs.logits.clone()[:, -1, :].float()
+                m_next_token_logits = m_next_token_logits.to(input_ids.device)
+
+                if getattr(self.config, "is_model_parallel", False) and self.config.is_model_parallel:
+                    gathered_m_next_token_logits = mpu.all_gather(
+                        m_next_token_logits.contiguous(),
+                        dim=-1,
+                        world_size=mpu.get_model_parallel_world_size(),
+                        group=mpu.get_model_parallel_group())
+                    # pre-process distribution                                
+                    m_next_token_scores = logits_processor(input_ids, gathered_m_next_token_logits)
+                else:
+                    m_next_token_scores = logits_processor(input_ids, m_next_token_logits)
+                
+                m_probs = nn.functional.softmax(m_next_token_scores.float(), dim=-1)
+            # ### MiniLLM END ###
 
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
                 if output_scores:
-                    scores += (next_token_scores,)
+                    scores += (next_token_scores_return,)
                 if output_logits:
                     raw_logits += (next_token_logits,)
                 if output_attentions:
@@ -3250,10 +3326,27 @@ class GenerationMixin:
             # token selection
             if do_sample:
                 probs = nn.functional.softmax(next_token_scores, dim=-1)
+                # ### MiniLLM BEGIN ###
+                if mix_in_model is not None:
+                    probs = (1 - mix_in_alpha) * probs + mix_in_alpha * m_probs
+                # ### MiniLLM END ###
                 # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
-                next_tokens = torch.argmax(next_token_scores, dim=-1)
+                # ### MiniLLM BEGIN ###
+                if mix_in_model is not None:
+                    probs = nn.functional.softmax(next_token_scores, dim=-1)
+                    if mix_in_model is not None:
+                        probs = (1 - mix_in_alpha) * probs + mix_in_alpha * m_probs
+                    next_tokens = torch.argmax(probs, dim=-1)
+                else:
+                    next_tokens = torch.argmax(next_token_scores, dim=-1)
+                # ### MiniLLM END ###
+
+            # ### MiniLLM BEGIN ###
+            if getattr(self.config, "is_model_parallel", False):
+                dist.broadcast(next_tokens, src=mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
+            # ### MiniLLM END ###
 
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
@@ -3271,6 +3364,10 @@ class GenerationMixin:
             # This is needed to properly delete outputs.logits which may be very large for first iteration
             # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
             del outputs
+            # ### MiniLLM BEGIN ###
+            if mix_in_model is not None:
+                del m_outputs
+            # ### MiniLLM END ###
 
         if streamer is not None:
             streamer.end()

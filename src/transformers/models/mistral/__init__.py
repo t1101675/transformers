@@ -66,6 +66,12 @@ else:
         "TFMistralForSequenceClassification",
         "TFMistralPreTrainedModel",
     ]
+    
+    _import_structure["mp_utils_mistral"] = [
+        "decrease_mp_mistral",
+        "increase_mp_mistral",
+    ]
+
 
 
 if TYPE_CHECKING:
@@ -85,6 +91,12 @@ if TYPE_CHECKING:
             MistralModel,
             MistralPreTrainedModel,
         )
+        
+        from .mp_utils_mistral import (
+            increase_mp_mistral,
+            decrease_mp_mistral
+        )
+
 
     try:
         if not is_flax_available():

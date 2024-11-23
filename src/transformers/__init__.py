@@ -2326,6 +2326,8 @@ else:
             "GPT2Model",
             "GPT2PreTrainedModel",
             "load_tf_weights_in_gpt2",
+            "decrease_mp_gpt2",
+            "increase_mp_gpt2"
         ]
     )
     _import_structure["models.gpt_bigcode"].extend(
@@ -2572,6 +2574,9 @@ else:
             "LlamaForTokenClassification",
             "LlamaModel",
             "LlamaPreTrainedModel",
+            "decrease_mp_llama",
+            "increase_mp_llama"
+
         ]
     )
     _import_structure["models.llava"].extend(
@@ -2744,6 +2749,8 @@ else:
             "MixtralForTokenClassification",
             "MixtralModel",
             "MixtralPreTrainedModel",
+            "decrease_mp_mistral",
+            "increase_mp_mistral"
         ]
     )
     _import_structure["models.mllama"].extend(
@@ -2955,6 +2962,8 @@ else:
             "OPTForSequenceClassification",
             "OPTModel",
             "OPTPreTrainedModel",
+            "decrease_mp_opt",
+            "increase_mp_opt"
         ]
     )
     _import_structure["models.owlv2"].extend(
@@ -7066,6 +7075,8 @@ if TYPE_CHECKING:
             GPT2Model,
             GPT2PreTrainedModel,
             load_tf_weights_in_gpt2,
+            decrease_mp_gpt2,
+            increase_mp_gpt2
         )
         from .models.gpt_bigcode import (
             GPTBigCodeForCausalLM,
@@ -7254,6 +7265,8 @@ if TYPE_CHECKING:
             LlamaForTokenClassification,
             LlamaModel,
             LlamaPreTrainedModel,
+            decrease_mp_llama,
+            increase_mp_llama
         )
         from .models.llava import (
             LlavaForConditionalGeneration,
@@ -7376,6 +7389,8 @@ if TYPE_CHECKING:
             MistralForTokenClassification,
             MistralModel,
             MistralPreTrainedModel,
+            decrease_mp_mistral,
+            increase_mp_mistral
         )
         from .models.mixtral import (
             MixtralForCausalLM,
@@ -7549,6 +7564,8 @@ if TYPE_CHECKING:
             OPTForSequenceClassification,
             OPTModel,
             OPTPreTrainedModel,
+            decrease_mp_opt,
+            increase_mp_opt
         )
         from .models.owlv2 import (
             Owlv2ForObjectDetection,

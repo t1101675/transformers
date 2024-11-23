@@ -45,6 +45,16 @@ from ...utils import (
 )
 from .configuration_opt import OPTConfig
 
+# ### MiniLLM BEGIN ###
+import torch.nn.functional as F
+from ...mpu.initialize import get_model_parallel_world_size
+from ...mpu.initialize import get_model_parallel_rank
+from ...mpu.utils import divide
+from ...mpu import copy_to_model_parallel_region
+from ...mpu.layers import ColumnParallelLinear
+from ...mpu.layers import RowParallelLinear
+from ...mpu import VocabParallelEmbedding
+# ### MiniLLM END ###
 
 if is_flash_attn_2_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
@@ -119,10 +129,35 @@ class OPTAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.is_decoder = is_decoder
 
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.world_size = get_model_parallel_world_size() # p
+            embed_dim_full = self.embed_dim
+            self.embed_dim = divide(self.embed_dim, self.world_size) # h_p
+            self.num_heads = divide(self.num_heads, self.world_size) # n_p
+            
+            self.k_proj = ColumnParallelLinear(embed_dim_full, embed_dim_full,
+                                            stride=1,
+                                            bias=self.enable_bias,
+                                            gather_output=False)
+            self.v_proj = ColumnParallelLinear(embed_dim_full, embed_dim_full,
+                                            stride=1,
+                                            bias=self.enable_bias,
+                                            gather_output=False)
+            self.q_proj = ColumnParallelLinear(embed_dim_full, embed_dim_full,
+                                            stride=1,
+                                            bias=self.enable_bias,
+                                            gather_output=False)
+            
+            self.out_proj = RowParallelLinear(embed_dim_full, embed_dim_full,
+                                            input_is_parallel=True,
+                                            bias=self.enable_bias)
+        else:
+            self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
+            self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
+            self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
+            self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
+        # ### MiniLLM END ###
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int) -> torch.Tensor:
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -490,8 +525,24 @@ class OPTDecoderLayer(nn.Module):
         self.self_attn_layer_norm = nn.LayerNorm(
             self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine
         )
-        self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=config.enable_bias)
-        self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.fc1 = ColumnParallelLinear(
+                self.embed_dim,
+                config.ffn_dim,
+                gather_output=False,
+                bias=config.enable_bias,
+            )
+            self.fc2 = RowParallelLinear(
+                config.ffn_dim,
+                self.embed_dim,
+                bias=config.enable_bias,
+                input_is_parallel=True,
+            )
+        else:
+            self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=config.enable_bias)
+            self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
+        # ### MiniLLM END ###
         self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
 
     def forward(
@@ -698,7 +749,12 @@ class OPTDecoder(OPTPreTrainedModel):
         self.max_target_positions = config.max_position_embeddings
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.word_embed_proj_dim, self.padding_idx)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.word_embed_proj_dim, padding_idx=self.padding_idx)
+        else:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.word_embed_proj_dim, self.padding_idx)
+        # ### MiniLLM END ###
         self.embed_positions = OPTLearnedPositionalEmbedding(config.max_position_embeddings, config.hidden_size)
 
         if config.word_embed_proj_dim != config.hidden_size:
@@ -726,6 +782,9 @@ class OPTDecoder(OPTPreTrainedModel):
         self._use_sdpa = config._attn_implementation == "sdpa"
 
         self.gradient_checkpointing = False
+        # ### MiniLLM BEGIN ###
+        self.force_gradient_checkpointing = False
+        # ### MiniLLM END ###
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -885,7 +944,10 @@ class OPTDecoder(OPTPreTrainedModel):
 
         hidden_states = inputs_embeds + pos_embeds
 
-        if self.gradient_checkpointing and self.training:
+        # ### MiniLLM BEGIN ###
+        # Gradient checkpointing in the model.eval() mode for PPO training
+        if self.force_gradient_checkpointing or (self.gradient_checkpointing and self.training and use_cache):
+        # ### MiniLLM END ###
             if use_cache:
                 logger.warning_once(
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
@@ -917,8 +979,9 @@ class OPTDecoder(OPTPreTrainedModel):
                     continue
 
             past_key_value = past_key_values[idx] if past_key_values is not None else None
-
-            if self.gradient_checkpointing and self.training:
+            # ### MiniLLM BEGIN ###
+            if self.force_gradient_checkpointing or (self.gradient_checkpointing and self.training):
+            # ### MiniLLM END ###
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -1049,8 +1112,12 @@ class OPTForCausalLM(OPTPreTrainedModel, GenerationMixin):
         self.model = OPTModel(config)
 
         # the lm_head weight is automatically tied to the embed tokens weight
-        self.lm_head = nn.Linear(config.word_embed_proj_dim, config.vocab_size, bias=False)
-
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.lm_head = VocabParallelEmbedding(config.vocab_size, config.word_embed_proj_dim)
+        else:
+            self.lm_head = nn.Linear(config.word_embed_proj_dim, config.vocab_size, bias=False)
+        # ### MiniLLM END ###
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1071,6 +1138,9 @@ class OPTForCausalLM(OPTPreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model.decoder
+
+    def set_force_gradient_checkpointing(self, value):
+        self.model.decoder.force_gradient_checkpointing = value
 
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -1185,8 +1255,14 @@ class OPTForCausalLM(OPTPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-
-        logits = self.lm_head(outputs[0]).contiguous()
+        # ### MiniLLM BEGIN ###
+        if getattr(self.config, "is_model_parallel", False):
+            hidden_state_parallel = copy_to_model_parallel_region(outputs[0])
+            logits_parallel = F.linear(hidden_state_parallel, self.lm_head.weight)
+            logits = logits_parallel
+        else:
+            logits = self.lm_head(outputs[0]).contiguous()
+        # ### MiniLLM END ###
 
         loss = None
         if labels is not None:

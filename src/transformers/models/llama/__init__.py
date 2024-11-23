@@ -58,11 +58,6 @@ else:
         "LlamaForTokenClassification",
     ]
 
-    _import_structure["mp_utils_llama"] = [
-        "decrease_mp_llama",
-        "increase_mp_llama",
-    ]
-
 try:
     if not is_flax_available():
         raise OptionalDependencyNotAvailable()
@@ -104,11 +99,6 @@ if TYPE_CHECKING:
             LlamaForTokenClassification,
             LlamaModel,
             LlamaPreTrainedModel,
-        )
-
-        from .mp_utils_llama import (
-            increase_mp_llama,
-            decrease_mp_llama
         )
 
     try:

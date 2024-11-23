@@ -39,13 +39,6 @@ else:
         "OPTForQuestionAnswering",
     ]
 
-    # ### MiniLLM Begin ###
-    _import_structure["mp_utils_opt"] = [
-        "decrease_mp_opt",
-        "increase_mp_opt",
-    ]
-    # ### MiniLLM End ###
-
 try:
     if not is_tf_available():
         raise OptionalDependencyNotAvailable()
@@ -83,13 +76,6 @@ if TYPE_CHECKING:
             OPTModel,
             OPTPreTrainedModel,
         )
-
-        # ### MiniLLM Begin ###
-        from .mp_utils_opt import (
-            increase_mp_opt,
-            decrease_mp_opt
-        )
-        # ### MiniLLM End ###
 
     try:
         if not is_tf_available():

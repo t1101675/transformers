@@ -51,6 +51,16 @@ from ...utils import (
 )
 from .configuration_qwen2 import Qwen2Config
 
+# ### MiniLLM BEGIN ###
+import torch.nn.functional as F
+from ...mpu.initialize import get_model_parallel_world_size
+from ...mpu.initialize import get_model_parallel_rank
+from ...mpu.utils import divide
+from ...mpu import copy_to_model_parallel_region
+from ...mpu.layers import ColumnParallelLinear
+from ...mpu.layers import RowParallelLinear
+from ...mpu import VocabParallelEmbedding
+# ### MiniLLM END ###
 
 if is_flash_attn_2_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
@@ -214,9 +224,31 @@ class Qwen2MLP(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.gate_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                gather_output=False,
+                bias=False,
+            )
+            self.down_proj = RowParallelLinear(
+                self.intermediate_size,
+                self.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+            )
+            self.up_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                gather_output=False,
+                bias=False,
+            )
+        else:
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        # ### MiniLLM END ###
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_state):
@@ -268,10 +300,42 @@ class Qwen2Attention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.world_size = get_model_parallel_world_size() # p
+            hidden_size_full = self.hidden_size
+            self.hidden_size = divide(self.hidden_size, self.world_size) # h_p
+            num_heads_full = self.num_heads
+            self.num_heads = divide(self.num_heads, self.world_size) # n_p
+            num_key_value_heads_full = self.num_key_value_heads
+            self.num_key_value_heads = divide(self.num_key_value_heads, self.world_size) # n_kv_p
+
+            self.q_proj = ColumnParallelLinear(hidden_size_full,
+                                            num_heads_full * self.head_dim,
+                                            stride=1,
+                                            bias=True,
+                                            gather_output=False)
+            self.k_proj = ColumnParallelLinear(hidden_size_full,
+                                            num_key_value_heads_full * self.head_dim,
+                                            stride=1,
+                                            bias=True,
+                                            gather_output=False)
+            self.v_proj = ColumnParallelLinear(hidden_size_full,
+                                            num_key_value_heads_full * self.head_dim,
+                                            stride=1,
+                                            bias=True,
+                                            gather_output=False)
+
+            self.o_proj = RowParallelLinear(num_heads_full * self.head_dim,
+                                            hidden_size_full,
+                                            input_is_parallel=True,
+                                            bias=False)
+        else:
+            self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
+            self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+            self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+            self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        # ### MiniLLM END ###
 
         self.rotary_emb = Qwen2RotaryEmbedding(config=self.config)
 
@@ -786,7 +850,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
+        else:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        # ### MiniLLM END ###
         self.layers = nn.ModuleList(
             [Qwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -795,6 +864,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False
+        # ### MiniLLM BEGIN ###
+        self.force_gradient_checkpointing = False
+        # ### MiniLLM END ###
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -829,7 +902,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        if self.gradient_checkpointing and self.training:
+        # ### MiniLLM BEGIN ###
+        # Gradient checkpointing in the model.eval() mode for PPO training
+        if self.force_gradient_checkpointing or (self.gradient_checkpointing and self.training and use_cache):
+        # ### MiniLLM END ###
             if use_cache:
                 logger.warning_once(
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
@@ -879,7 +955,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
+            # ### MiniLLM BEGIN ###
+            # Gradient checkpointing in the model.eval() mode for PPO training
+            if self.force_gradient_checkpointing or (self.gradient_checkpointing and self.training):
+            # ### MiniLLM END ###
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -1082,7 +1161,12 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen2Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # ### MiniLLM BEGIN ###
+        if getattr(config, "is_model_parallel", False):
+            self.lm_head = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        else:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # ### MiniLLM END ###
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1104,6 +1188,11 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model
+
+    # ### MiniLLM BEGIN ###
+    def set_force_gradient_checkpointing(self, value):
+        self.model.force_gradient_checkpointing = value
+    # ### MiniLLM END ###
 
     @add_start_docstrings_to_model_forward(QWEN2_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -1176,7 +1265,13 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
 
         hidden_states = outputs[0]
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+        # ### MiniLLM BEGIN ###
+        if getattr(self.config, "is_model_parallel", False):
+            hidden_states = copy_to_model_parallel_region(hidden_states)
+            logits = F.linear(hidden_states[:, -num_logits_to_keep:, :], self.lm_head.weight)
+        else:
+            logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+        # ### MiniLLM END ###
 
         loss = None
         if labels is not None:

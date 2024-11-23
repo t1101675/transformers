@@ -250,24 +250,25 @@ class LlamaMLP(nn.Module):
                 self.hidden_size,
                 self.intermediate_size,
                 gather_output=False,
-                bias=False,
+                bias=config.mlp_bias,
             )
             self.down_proj = RowParallelLinear(
                 self.intermediate_size,
                 self.hidden_size,
-                bias=False,
+                bias=config.mlp_bias,
                 input_is_parallel=True,
             )
             self.up_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.intermediate_size,
                 gather_output=False,
-                bias=False,
+                bias=config.mlp_bias,
             )
         else:
             self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
             self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
             self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        # ### MiniLLM END ###
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):

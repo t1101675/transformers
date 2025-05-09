@@ -672,6 +672,9 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                 max_cache_len=seq_len,
                 dtype=inputs_embeds.dtype,
             )
+        
+        if past_key_values is not None:
+            past_key_values.is_compileable = False # compatible with flash-attention-2
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -988,6 +991,9 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
     ):
         # Overwritten: has a special cache type, `HybridCache`
 
+        if past_key_values is not None:
+            past_key_values.is_compileable = False  # compatible with flash-attention-2
+        
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
@@ -1025,6 +1031,8 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
                 batch_size=batch_size,
             )
             model_inputs["attention_mask"] = attention_mask
+
+        model_inputs["past_key_values"].is_compileable = False
 
         return model_inputs
 

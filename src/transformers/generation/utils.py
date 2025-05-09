@@ -2113,6 +2113,9 @@ class GenerationMixin:
         valid_hardware = self.device.type == "cuda" or bool(
             generation_config.compile_config is not None and generation_config.compile_config._compile_all_devices
         )
+        
+        print("is_compileable", model_kwargs["past_key_values"].is_compileable)
+        
         using_compilable_cache = (
             isinstance(model_kwargs.get("past_key_values"), Cache) and model_kwargs["past_key_values"].is_compileable
         )
@@ -3434,7 +3437,8 @@ class GenerationMixin:
         model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
 
         model_forward = self.__call__
-        compile_forward = self._valid_auto_compile_criteria(model_kwargs, generation_config)
+        # compile_forward = self._valid_auto_compile_criteria(model_kwargs, generation_config)
+        compile_forward = False
         if compile_forward:
             os.environ["TOKENIZERS_PARALLELISM"] = "0"
             model_forward = self.get_compiled_call(generation_config.compile_config)
@@ -3445,6 +3449,10 @@ class GenerationMixin:
         else:
             is_prefill = True
 
+        if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+            from tqdm import tqdm
+            pbar = tqdm(total=generation_config.max_new_tokens, desc="Generation")
+
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -3454,10 +3462,31 @@ class GenerationMixin:
             model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
 
             if is_prefill:
+                if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                    prefill_start = torch.cuda.Event(enable_timing=True)
+                    prefill_end = torch.cuda.Event(enable_timing=True)
+                    prefill_start.record()
                 outputs = self(**model_inputs, return_dict=True)
+                
+                if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                    torch.cuda.synchronize()
+                    prefill_end.record()
+                    torch.cuda.synchronize()
+                    prefill_time = prefill_start.elapsed_time(prefill_end)
+                
                 is_prefill = False
             else:
+                if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                    decode_start = torch.cuda.Event(enable_timing=True)
+                    decode_end = torch.cuda.Event(enable_timing=True)
+                    decode_start.record()
                 outputs = model_forward(**model_inputs, return_dict=True)
+
+                if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                    torch.cuda.synchronize()
+                    decode_end.record()
+                    torch.cuda.synchronize()
+                    decode_time = prefill_start.elapsed_time(decode_end)
 
             # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -3516,6 +3545,9 @@ class GenerationMixin:
             this_peer_finished = unfinished_sequences.max() == 0
             cur_len += 1
 
+            if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                pbar.update(1)
+
             # This is needed to properly delete outputs.logits which may be very large for first iteration
             # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
             del outputs
@@ -3537,7 +3569,7 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
             else:
-                return GenerateDecoderOnlyOutput(
+                out = GenerateDecoderOnlyOutput(
                     sequences=input_ids,
                     scores=scores,
                     logits=raw_logits,
@@ -3545,8 +3577,14 @@ class GenerationMixin:
                     hidden_states=decoder_hidden_states,
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
+                if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                    out = (out, prefill_time, decode_time)
+                return out
         else:
-            return input_ids
+            if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                return input_ids, prefill_time, decode_time
+            else:
+                return input_ids
 
     # Auxiliary functions for beam search
     def _temporary_reorder_cache(self, past_key_values, beam_idx):

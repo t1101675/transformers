@@ -3443,16 +3443,25 @@ class GenerationMixin:
             os.environ["TOKENIZERS_PARALLELISM"] = "0"
             model_forward = self.get_compiled_call(generation_config.compile_config)
 
+        if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            prefill_time, decode_time = 0, 0
+
         if generation_config.prefill_chunk_size is not None:
+            if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+                prefill_start = torch.cuda.Event(enable_timing=True)
+                prefill_end = torch.cuda.Event(enable_timing=True)
+                prefill_start.record()
             model_kwargs = self._prefill_chunking(input_ids, generation_config, **model_kwargs)
+            if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+                torch.cuda.synchronize()
+                prefill_end.record()
+                torch.cuda.synchronize()
+                prefill_time = prefill_start.elapsed_time(prefill_end)
             is_prefill = False
         else:
             is_prefill = True
 
-        if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
-            from tqdm import tqdm
-            pbar = tqdm(total=generation_config.max_new_tokens, desc="Generation")
-
+        is_first_decode_step = True
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -3462,13 +3471,13 @@ class GenerationMixin:
             model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
 
             if is_prefill:
-                if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                     prefill_start = torch.cuda.Event(enable_timing=True)
                     prefill_end = torch.cuda.Event(enable_timing=True)
                     prefill_start.record()
                 outputs = self(**model_inputs, return_dict=True)
                 
-                if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                     torch.cuda.synchronize()
                     prefill_end.record()
                     torch.cuda.synchronize()
@@ -3476,17 +3485,22 @@ class GenerationMixin:
                 
                 is_prefill = False
             else:
-                if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+                    if is_first_decode_step:
+                        from tqdm import tqdm
+                        pbar = tqdm(total=generation_config.max_new_tokens, desc="Generation")
+
                     decode_start = torch.cuda.Event(enable_timing=True)
                     decode_end = torch.cuda.Event(enable_timing=True)
                     decode_start.record()
                 outputs = model_forward(**model_inputs, return_dict=True)
+                is_first_decode_step = False
 
-                if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                     torch.cuda.synchronize()
                     decode_end.record()
                     torch.cuda.synchronize()
-                    decode_time = prefill_start.elapsed_time(decode_end)
+                    decode_time += decode_start.elapsed_time(decode_end)
 
             # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -3545,7 +3559,7 @@ class GenerationMixin:
             this_peer_finished = unfinished_sequences.max() == 0
             cur_len += 1
 
-            if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+            if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                 pbar.update(1)
 
             # This is needed to properly delete outputs.logits which may be very large for first iteration
@@ -3577,11 +3591,11 @@ class GenerationMixin:
                     hidden_states=decoder_hidden_states,
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
-                if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+                if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                     out = (out, prefill_time, decode_time)
                 return out
         else:
-            if os.environ.get("BENCKMARK_MODE", "False") in ["True", "1", "true"]:
+            if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                 return input_ids, prefill_time, decode_time
             else:
                 return input_ids
@@ -4945,10 +4959,14 @@ class GenerationMixin:
         if "past_key_values" not in model_kwargs:
             raise ValueError("Cannot use prefill chunkink without a cache")
 
-        model_forward = self.get_compiled_call(generation_config.compile_config)
+        # model_forward = self.get_compiled_call(generation_config.compile_config)  # @GYX: do not compile
         attention_mask = model_kwargs.pop("attention_mask", None)
 
         past_length = 0
+        if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            from tqdm import tqdm
+            pbar = tqdm(total=len(input_chunks), desc="Prefilling")
+        
         for input_chunk in input_chunks:
             current_length = past_length + input_chunk.shape[-1]
             # Prepare inputs
@@ -4960,10 +4978,13 @@ class GenerationMixin:
             model_kwargs["position_ids"] = model_kwargs["cache_position"].unsqueeze(0)
             model_inputs = self.prepare_inputs_for_generation(input_chunk, **model_kwargs)
 
-            outputs = model_forward(**model_inputs, return_dict=True)
+            outputs = self(**model_inputs, return_dict=True)
 
             model_kwargs["past_key_values"] = outputs.past_key_values
             past_length = current_length
+            
+            if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+                pbar.update(1)
 
         model_kwargs["attention_mask"] = attention_mask
         model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + 1

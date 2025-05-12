@@ -610,7 +610,7 @@ class Zamba2MambaMixer(nn.Module):
         d_to_remove = 2 * self.intermediate_size + 2 * self.n_groups * self.ssm_state_size + self.num_heads
 
         # getting projected states from cache if it exists
-        if cache_params is not None and cache_params.has_previous_state:
+        if cache_params is not None and cache_params.has_previous_state and seq_len == 1:
             in_projected_states = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
             d_mlp = (in_projected_states.shape[-1] - d_to_remove) // 2
             split_projection_dim = [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads]
@@ -658,7 +658,7 @@ class Zamba2MambaMixer(nn.Module):
             if attention_mask is not None and not torch.all(attention_mask == 1):
                 # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
                 dtype = hidden_states.dtype
-                hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+                hidden_states = (hidden_states * attention_mask[:, -hidden_states.shape[1]:, None]).to(dtype)
             # 1. Gated MLP's linear projection
             projected_states = self.in_proj(hidden_states)
             A = -torch.exp(self.A_log.float())  # (num_heads) or (intermediate_size, state_size)
@@ -668,7 +668,7 @@ class Zamba2MambaMixer(nn.Module):
             else:
                 input_not_masked = True
 
-            if self.use_mem_eff_path and self.training and cache_params is None and input_not_masked:
+            if self.use_mem_eff_path and self.training and input_not_masked:
                 out, ssm_state = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
@@ -677,6 +677,7 @@ class Zamba2MambaMixer(nn.Module):
                     A,
                     D=self.D,
                     chunk_size=self.chunk_size,
+                    initial_states=cache_params.ssm_states[self.layer_idx],
                     seq_idx=None,
                     activation=self.activation,
                     rmsnorm_weight=self.norm.weight,
@@ -723,7 +724,7 @@ class Zamba2MambaMixer(nn.Module):
                 if attention_mask is not None and not torch.all(attention_mask == 1):
                     # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
                     dtype = hidden_states.dtype
-                    hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+                    hidden_states = (hidden_states * attention_mask[:, -hidden_states.shape[1]:, None]).to(dtype)
                 scan_output, ssm_state = mamba_chunk_scan_combined(
                     hidden_states.view(batch_size, seq_len, -1, self.head_dim),
                     time_step,

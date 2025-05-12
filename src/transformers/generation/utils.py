@@ -4955,9 +4955,9 @@ class GenerationMixin:
         # Only chunk up the token just before last, so that decoding is completely performed outside this function
         # (here we simply prefill the cache)
         input_chunks = torch.split(input_ids[:, :-1], chunk_size, dim=-1)
-
-        if "past_key_values" not in model_kwargs:
-            raise ValueError("Cannot use prefill chunkink without a cache")
+     
+        # if "past_key_values" not in model_kwargs:
+        #     raise ValueError("Cannot use prefill chunkink without a cache")
 
         # model_forward = self.get_compiled_call(generation_config.compile_config)  # @GYX: do not compile
         attention_mask = model_kwargs.pop("attention_mask", None)

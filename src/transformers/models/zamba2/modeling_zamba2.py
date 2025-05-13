@@ -451,12 +451,14 @@ class Zamba2Attention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        # print(self.config._attn_implementation)
+        
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
             key_states,
             value_states,
-            attention_mask,
+            None,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             **kwargs,
@@ -603,6 +605,7 @@ class Zamba2MambaMixer(nn.Module):
         cache_params: Optional[Zamba2HybridDynamicCache] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
+        attention_mask = None # @GYX: set attention_mask to None for benchmarking
         # set up dimensions for reshapes later
 
         batch_size, seq_len, _ = hidden_states.shape

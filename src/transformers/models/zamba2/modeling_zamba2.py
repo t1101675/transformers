@@ -605,7 +605,9 @@ class Zamba2MambaMixer(nn.Module):
         cache_params: Optional[Zamba2HybridDynamicCache] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
-        attention_mask = None # @GYX: set attention_mask to None for benchmarking
+        import os
+        if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            attention_mask = None # @GYX: set attention_mask to None for benchmarking
         # set up dimensions for reshapes later
 
         batch_size, seq_len, _ = hidden_states.shape

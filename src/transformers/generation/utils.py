@@ -723,22 +723,25 @@ class GenerationMixin:
         if pad_token_id is None:
             return default_attention_mask
 
-        is_input_ids = len(inputs_tensor.shape) == 2 and inputs_tensor.dtype in [torch.int, torch.long]
-        if not is_input_ids:
-            return default_attention_mask
+        if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            attention_mask = default_attention_mask
+        else:
+            is_input_ids = len(inputs_tensor.shape) == 2 and inputs_tensor.dtype in [torch.int, torch.long]
+            if not is_input_ids:
+                return default_attention_mask
 
-        is_pad_token_in_inputs = (pad_token_id is not None) and (
-            isin_mps_friendly(elements=inputs_tensor, test_elements=pad_token_id).any()
-        )
-        is_pad_token_not_equal_to_eos_token_id = (eos_token_id is None) or ~(
-            isin_mps_friendly(elements=eos_token_id, test_elements=pad_token_id).any()
-        )
-        can_infer_attention_mask = is_pad_token_in_inputs * is_pad_token_not_equal_to_eos_token_id
-        attention_mask_from_padding = inputs_tensor.ne(pad_token_id).long()
+            is_pad_token_in_inputs = (pad_token_id is not None) and (
+                isin_mps_friendly(elements=inputs_tensor, test_elements=pad_token_id).any()
+            )
+            is_pad_token_not_equal_to_eos_token_id = (eos_token_id is None) or ~(
+                isin_mps_friendly(elements=eos_token_id, test_elements=pad_token_id).any()
+            )
+            can_infer_attention_mask = is_pad_token_in_inputs * is_pad_token_not_equal_to_eos_token_id
+            attention_mask_from_padding = inputs_tensor.ne(pad_token_id).long()
 
-        attention_mask = (
-            attention_mask_from_padding * can_infer_attention_mask + default_attention_mask * ~can_infer_attention_mask
-        )
+            attention_mask = (
+                attention_mask_from_padding * can_infer_attention_mask + default_attention_mask * ~can_infer_attention_mask
+            )
         return attention_mask
 
     def _prepare_encoder_decoder_kwargs_for_generation(

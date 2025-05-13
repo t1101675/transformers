@@ -4975,12 +4975,17 @@ class GenerationMixin:
             model_kwargs["cache_position"] = torch.arange(
                 past_length, current_length, dtype=torch.long, device=input_chunk.device
             )
-            model_kwargs["position_ids"] = model_kwargs["cache_position"].unsqueeze(0)
+            if not "hymba" in self.__class__.__name__.lower():
+                model_kwargs["position_ids"] = model_kwargs["cache_position"].unsqueeze(0)
             model_inputs = self.prepare_inputs_for_generation(input_chunk, **model_kwargs)
 
             outputs = self(**model_inputs, return_dict=True)
-
-            model_kwargs["past_key_values"] = outputs.past_key_values
+            if "mamba" in self.__class__.__name__.lower():
+                model_kwargs["cache_params"] = outputs.cache_params
+            elif "recurrentgemma" in self.__class__.__name__.lower():
+                pass
+            else:
+                model_kwargs["past_key_values"] = outputs.past_key_values
             past_length = current_length
             
             if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:

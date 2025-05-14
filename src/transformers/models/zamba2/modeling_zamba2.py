@@ -458,7 +458,7 @@ class Zamba2Attention(nn.Module):
             query_states,
             key_states,
             value_states,
-            None,
+            attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             **kwargs,

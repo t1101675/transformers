@@ -261,7 +261,7 @@ class Gemma2Attention(nn.Module):
             query_states,
             key_states,
             value_states,
-            None,
+            attention_mask,
             dropout=self.attention_dropout if self.training else 0.0,
             scaling=self.scaling,
             sliding_window=self.sliding_window,

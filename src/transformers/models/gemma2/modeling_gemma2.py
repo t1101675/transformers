@@ -907,7 +907,7 @@ class Gemma2ForCausalLM(Gemma2PreTrainedModel, GenerationMixin):
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
-            attention_mask=attention_mask,
+            attention_mask=None,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
             position_ids=position_ids,
@@ -919,6 +919,8 @@ class Gemma2ForCausalLM(Gemma2PreTrainedModel, GenerationMixin):
         if logits_to_keep is None:
             _ = model_inputs.pop("logits_to_keep", None)
 
+        model_inputs["attention_mask"] = attention_mask
+        
         if (
             isinstance(past_key_values, HybridCache)
             and attention_mask.ndim == 2

@@ -723,7 +723,7 @@ class GenerationMixin:
         if pad_token_id is None:
             return default_attention_mask
 
-        if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+        if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
             attention_mask = default_attention_mask
         else:
             is_input_ids = len(inputs_tensor.shape) == 2 and inputs_tensor.dtype in [torch.int, torch.long]
@@ -2077,16 +2077,16 @@ class GenerationMixin:
             raise ValueError(
                 "`decoder_start_token_id` or `bos_token_id` has to be defined for encoder-decoder generation."
             )
-        if (
-            eos_token_tensor is not None
-            and isin_mps_friendly(elements=eos_token_tensor, test_elements=pad_token_tensor).any()
-        ):
-            if kwargs_has_attention_mask is not None and not kwargs_has_attention_mask:
-                logger.warning_once(
-                    "The attention mask is not set and cannot be inferred from input because pad token is same as "
-                    "eos token. As a consequence, you may observe unexpected behavior. Please pass your input's "
-                    "`attention_mask` to obtain reliable results."
-                )
+        # if (
+        #     eos_token_tensor is not None
+        #     and isin_mps_friendly(elements=eos_token_tensor, test_elements=pad_token_tensor).any()
+        # ):
+        #     if kwargs_has_attention_mask is not None and not kwargs_has_attention_mask:
+        #         logger.warning_once(
+        #             "The attention mask is not set and cannot be inferred from input because pad token is same as "
+        #             "eos token. As a consequence, you may observe unexpected behavior. Please pass your input's "
+        #             "`attention_mask` to obtain reliable results."
+        #         )
         if eos_token_tensor is not None and (
             torch.is_floating_point(eos_token_tensor) or (eos_token_tensor < 0).any()
         ):
@@ -2505,6 +2505,7 @@ class GenerationMixin:
                 generation_config=generation_config,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
+                tokenizer=tokenizer,
                 **model_kwargs,
             )
 
@@ -3373,6 +3374,7 @@ class GenerationMixin:
         generation_config: GenerationConfig,
         synced_gpus: bool,
         streamer: Optional["BaseStreamer"],
+        tokenizer: Optional["PreTrainedTokenizerBase"],
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         r"""
@@ -3444,16 +3446,16 @@ class GenerationMixin:
             os.environ["TOKENIZERS_PARALLELISM"] = "0"
             model_forward = self.get_compiled_call(generation_config.compile_config)
 
-        if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+        if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
             prefill_time, decode_time = 0, 0
 
         if generation_config.prefill_chunk_size is not None:
-            if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                 prefill_start = torch.cuda.Event(enable_timing=True)
                 prefill_end = torch.cuda.Event(enable_timing=True)
                 prefill_start.record()
             model_kwargs = self._prefill_chunking(input_ids, generation_config, **model_kwargs)
-            if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                 torch.cuda.synchronize()
                 prefill_end.record()
                 torch.cuda.synchronize()
@@ -3463,6 +3465,9 @@ class GenerationMixin:
             is_prefill = True
 
         is_first_decode_step = True
+        line_length = 0
+        token_buffer = ""
+        is_newline = True
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -3472,13 +3477,13 @@ class GenerationMixin:
             model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
 
             if is_prefill:
-                if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+                if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                     prefill_start = torch.cuda.Event(enable_timing=True)
                     prefill_end = torch.cuda.Event(enable_timing=True)
                     prefill_start.record()
                 outputs = self(**model_inputs, return_dict=True)
                 
-                if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+                if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                     torch.cuda.synchronize()
                     prefill_end.record()
                     torch.cuda.synchronize()
@@ -3486,10 +3491,18 @@ class GenerationMixin:
                 
                 is_prefill = False
             else:
-                if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+                if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                     if is_first_decode_step:
+                        from time import time, sleep
+                        input("")
+                        sleep(10)
+                        while True:
+                            sleep(0.1)
+                            if int(time()) % 10 == 0:
+                                break
+
                         from tqdm import tqdm
-                        pbar = tqdm(total=generation_config.max_new_tokens, desc="Generation")
+                        pbar = tqdm(total=generation_config.max_new_tokens, desc="Decoding")
 
                     decode_start = torch.cuda.Event(enable_timing=True)
                     decode_end = torch.cuda.Event(enable_timing=True)
@@ -3497,7 +3510,7 @@ class GenerationMixin:
                 outputs = model_forward(**model_inputs, return_dict=True)
                 is_first_decode_step = False
 
-                if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+                if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                     torch.cuda.synchronize()
                     decode_end.record()
                     torch.cuda.synchronize()
@@ -3547,6 +3560,34 @@ class GenerationMixin:
             else:
                 next_tokens = torch.argmax(next_token_scores, dim=-1)
 
+            if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"] and os.environ.get("ELLM_DEMO_MODE", "False") in ["True", "1", "true"] and tokenizer is not None:
+                token_str = tokenizer.decode(next_tokens[:, None][0].tolist(), skip_special_tokens=True)
+                if "\n" in token_str:
+                    line_length = 0
+                else:
+                    line_length += len(token_str)
+
+                if line_length <= 75:
+                    if is_newline:
+                        token_str = token_str.lstrip()
+                        is_newline = False
+                    pbar.write(token_str, end="")
+                    if "\n" in token_str:
+                        is_newline = True
+                else:
+                    if len(token_buffer) > 0:
+                        if token_str in ",'.\"-":
+                            token_buffer += token_str
+                            pbar.write(token_buffer + "\n", end="")
+                            is_newline = True
+                        else:
+                            pbar.write(token_buffer + "\n", end="")
+                            pbar.write(token_str.lstrip(), end="")
+                        line_length = 0
+                        token_buffer = ""
+                    else:
+                        token_buffer = token_str
+
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
@@ -3560,12 +3601,16 @@ class GenerationMixin:
             this_peer_finished = unfinished_sequences.max() == 0
             cur_len += 1
 
-            if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                 pbar.update(1)
 
             # This is needed to properly delete outputs.logits which may be very large for first iteration
             # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
             del outputs
+
+        if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            pbar.write("\n")
+            pbar.close()
 
         if streamer is not None:
             streamer.end()
@@ -3592,11 +3637,11 @@ class GenerationMixin:
                     hidden_states=decoder_hidden_states,
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
-                if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+                if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                     out = (out, prefill_time, decode_time)
                 return out
         else:
-            if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                 return input_ids, prefill_time, decode_time
             else:
                 return input_ids
@@ -4964,9 +5009,9 @@ class GenerationMixin:
         attention_mask = model_kwargs.pop("attention_mask", None)
 
         past_length = 0
-        if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+        if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
             from tqdm import tqdm
-            pbar = tqdm(total=len(input_chunks), desc="Prefilling")
+            pbar = tqdm(total=len(input_chunks), desc=f"Prefilling 0K/{round(input_ids.size(-1)/1024)}K. Mem: {torch.cuda.memory_allocated() / 1024**3:.1f}GB")
         
         for input_chunk in input_chunks:
             current_length = past_length + input_chunk.shape[-1]
@@ -4989,8 +5034,9 @@ class GenerationMixin:
                 model_kwargs["past_key_values"] = outputs.past_key_values
             past_length = current_length
             
-            if os.environ.get("BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                 pbar.update(1)
+                pbar.set_description(f"Prefilling {round(current_length/1024)}K/{round(input_ids.size(-1)/1024)}K. Mem: {torch.cuda.memory_allocated() / 1024**3:.1f}GB")
 
         model_kwargs["attention_mask"] = attention_mask
         model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + 1

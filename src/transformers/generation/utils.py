@@ -3493,13 +3493,14 @@ class GenerationMixin:
             else:
                 if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                     if is_first_decode_step:
-                        from time import time, sleep
-                        input("")
-                        sleep(10)
-                        while True:
-                            sleep(0.1)
-                            if int(time()) % 10 == 0:
-                                break
+                        if os.environ.get("ELLM_DEMO_MODE", "False") in ["True", "1", "true"]:
+                            from time import time, sleep
+                            input("")
+                            sleep(10)
+                            while True:
+                                sleep(0.1)
+                                if int(time()) % 10 == 0:
+                                    break
 
                         from tqdm import tqdm
                         pbar = tqdm(total=generation_config.max_new_tokens, desc="Decoding")
@@ -5036,7 +5037,7 @@ class GenerationMixin:
             
             if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                 pbar.update(1)
-                pbar.set_description(f"Prefilling {round(current_length/1024)}K/{round(input_ids.size(-1)/1024)}K. Mem: {torch.cuda.memory_allocated() / 1024**3:.1f}GB")
+                pbar.set_description(f"Prefilling {round(current_length/1024)}K/{round(input_ids.size(-1)/1024)}K.")
 
         model_kwargs["attention_mask"] = attention_mask
         model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + 1

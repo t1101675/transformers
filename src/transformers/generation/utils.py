@@ -5012,7 +5012,7 @@ class GenerationMixin:
         past_length = 0
         if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
             from tqdm import tqdm
-            pbar = tqdm(total=len(input_chunks), desc=f"Prefilling 0K/{round(input_ids.size(-1)/1024)}K.")
+            pbar = tqdm(total=len(input_chunks), desc=f"Prefilling 0K/{round(input_ids.size(-1)/1024)}K. Mem: {torch.cuda.memory_allocated() / 1024**2:.2f}MB")
         
         for input_chunk in input_chunks:
             current_length = past_length + input_chunk.shape[-1]

@@ -62,6 +62,9 @@ class TimmWrapperPreTrainedModel(PreTrainedModel):
     config_class = TimmWrapperConfig
     _no_split_modules = []
     model_tags = ["timm"]
+    _supports_flash_attn_2 = True
+    _supports_flash_attn_3 = True
+    _supports_sdpa = True
 
     # used in Trainer to avoid passing `loss_kwargs` to model forward
     accepts_loss_kwargs = False

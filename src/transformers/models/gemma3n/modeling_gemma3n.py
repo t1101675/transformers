@@ -915,6 +915,9 @@ class Gemma3nAudioEncoder(PreTrainedModel):
     """An audio encoder based on the [Universal Speech Model](https://arxiv.org/abs/2303.01037) architecture."""
 
     config_class = Gemma3nAudioConfig
+    _supports_flash_attn_2 = True
+    _supports_flash_attn_3 = True
+    _supports_sdpa = True
 
     main_input_name = "audio_mel"
 

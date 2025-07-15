@@ -3465,9 +3465,9 @@ class GenerationMixin:
             is_prefill = True
 
         is_first_decode_step = True
-        line_length = 0
-        token_buffer = ""
-        is_newline = True
+        # line_length = 0
+        # token_buffer = ""
+        # is_newline = True
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -3503,7 +3503,8 @@ class GenerationMixin:
                                     break
 
                         from tqdm import tqdm
-                        pbar = tqdm(total=generation_config.max_new_tokens, desc="Decoding")
+                        pbar = tqdm(total=generation_config.max_new_tokens * input_ids.shape[0], desc="Decoding", unit="tokens",
+                                    disable=(os.environ.get("ELLM_DISABLE_DECODE_BAR", "0") in ["1", "true", "True"]))
 
                     decode_start = torch.cuda.Event(enable_timing=True)
                     decode_end = torch.cuda.Event(enable_timing=True)
@@ -3561,33 +3562,33 @@ class GenerationMixin:
             else:
                 next_tokens = torch.argmax(next_token_scores, dim=-1)
 
-            if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"] and os.environ.get("ELLM_DEMO_MODE", "False") in ["True", "1", "true"] and tokenizer is not None:
-                token_str = tokenizer.decode(next_tokens[:, None][0].tolist(), skip_special_tokens=True)
-                if "\n" in token_str:
-                    line_length = 0
-                else:
-                    line_length += len(token_str)
+            # if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"] and os.environ.get("ELLM_DEMO_MODE", "False") in ["True", "1", "true"] and tokenizer is not None:
+            #     token_str = tokenizer.decode(next_tokens[:, None][0].tolist(), skip_special_tokens=True)
+            #     if "\n" in token_str:
+            #         line_length = 0
+            #     else:
+            #         line_length += len(token_str)
 
-                if line_length <= 75:
-                    if is_newline:
-                        token_str = token_str.lstrip()
-                        is_newline = False
-                    pbar.write(token_str, end="")
-                    if "\n" in token_str:
-                        is_newline = True
-                else:
-                    if len(token_buffer) > 0:
-                        if token_str in ",'.\"-":
-                            token_buffer += token_str
-                            pbar.write(token_buffer + "\n", end="")
-                            is_newline = True
-                        else:
-                            pbar.write(token_buffer + "\n", end="")
-                            pbar.write(token_str.lstrip(), end="")
-                        line_length = 0
-                        token_buffer = ""
-                    else:
-                        token_buffer = token_str
+            #     if line_length <= 75:
+            #         if is_newline:
+            #             token_str = token_str.lstrip()
+            #             is_newline = False
+            #         pbar.write(token_str, end="")
+            #         if "\n" in token_str:
+            #             is_newline = True
+            #     else:
+            #         if len(token_buffer) > 0:
+            #             if token_str in ",'.\"-":
+            #                 token_buffer += token_str
+            #                 pbar.write(token_buffer + "\n", end="")
+            #                 is_newline = True
+            #             else:
+            #                 pbar.write(token_buffer + "\n", end="")
+            #                 pbar.write(token_str.lstrip(), end="")
+            #             line_length = 0
+            #             token_buffer = ""
+            #         else:
+            #             token_buffer = token_str
 
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
@@ -3603,14 +3604,14 @@ class GenerationMixin:
             cur_len += 1
 
             if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
-                pbar.update(1)
+                pbar.update(input_ids.shape[0])
 
             # This is needed to properly delete outputs.logits which may be very large for first iteration
             # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
             del outputs
 
         if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
-            pbar.write("\n")
+            # pbar.write("\n")
             pbar.close()
 
         if streamer is not None:
@@ -5012,7 +5013,8 @@ class GenerationMixin:
         past_length = 0
         if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
             from tqdm import tqdm
-            pbar = tqdm(total=len(input_chunks), desc=f"Prefilling 0K/{round(input_ids.size(-1)/1024)}K. Mem: {torch.cuda.memory_allocated() / 1024**2:.2f}MB")
+            pbar = tqdm(total=len(input_chunks), desc=f"Prefilling 0K/{round(input_ids.size(-1)/1024)}K. Mem: {torch.cuda.memory_allocated() / 1024**3:.2f}GB",
+                        disable=(os.environ.get("ELLM_DISABLE_PREFILL_BAR", "0") in ["1", "true", "True"]))
         
         for input_chunk in input_chunks:
             current_length = past_length + input_chunk.shape[-1]
@@ -5037,7 +5039,7 @@ class GenerationMixin:
             
             if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
                 pbar.update(1)
-                pbar.set_description(f"Prefilling {round(current_length/1024)}K/{round(input_ids.size(-1)/1024)}K.")
+                pbar.set_description(f"Prefilling {round(current_length/1024)}K/{round(input_ids.size(-1)/1024)}K. Mem: {torch.cuda.memory_allocated() / 1024**3:.2f}GB")
 
         model_kwargs["attention_mask"] = attention_mask
         model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + 1

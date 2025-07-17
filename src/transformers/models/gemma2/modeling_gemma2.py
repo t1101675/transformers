@@ -221,6 +221,9 @@ class Gemma2Attention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        # print(query_states.shape, key_states.shape, value_states.shape)
+        # print(attention_mask.shape)
+        # exit(0)
         attn_output, attn_weights = attention_interface(
             self,
             query_states,

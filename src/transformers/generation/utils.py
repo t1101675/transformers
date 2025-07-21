@@ -5041,7 +5041,6 @@ class GenerationMixin:
                 else:
                     model_kwargs["position_ids"] = model_kwargs["cache_position"].unsqueeze(0)
             model_inputs = self.prepare_inputs_for_generation(input_chunk, **model_kwargs)
-            model_inputs["logits_to_keep"] = 1 if cid == len(input_chunks) - 1 else 0
             
             outputs = self(**model_inputs, return_dict=True)
             if "mamba" in self.__class__.__name__.lower():

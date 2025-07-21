@@ -5009,6 +5009,17 @@ class GenerationMixin:
 
         # model_forward = self.get_compiled_call(generation_config.compile_config)  # @GYX: do not compile
         attention_mask = model_kwargs.pop("attention_mask", None)
+        position_ids_key = "decoder_position_ids" if self.config.is_encoder_decoder else "position_ids"
+        if (
+            attention_mask is not None
+            and model_kwargs.get(position_ids_key) is None
+            and position_ids_key in set(inspect.signature(self.forward).parameters.keys())
+        ):
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            model_kwargs[position_ids_key] = position_ids  # placed in kwargs for further processing (see below)
+
+        position_ids = model_kwargs.get(position_ids_key, None)
 
         past_length = 0
         if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
@@ -5016,7 +5027,7 @@ class GenerationMixin:
             pbar = tqdm(total=len(input_chunks), desc=f"Prefilling 0K/{round(input_ids.size(-1)/1024)}K. Mem: {torch.cuda.memory_allocated() / 1024**3:.2f}GB",
                         disable=(os.environ.get("ELLM_DISABLE_PREFILL_BAR", "0") in ["1", "true", "True"]))
         
-        for input_chunk in input_chunks:
+        for cid, input_chunk in enumerate(input_chunks):
             current_length = past_length + input_chunk.shape[-1]
             # Prepare inputs
             if attention_mask is not None:
@@ -5025,9 +5036,13 @@ class GenerationMixin:
                 past_length, current_length, dtype=torch.long, device=input_chunk.device
             )
             if not "hymba" in self.__class__.__name__.lower():
-                model_kwargs["position_ids"] = model_kwargs["cache_position"].unsqueeze(0)
+                if position_ids is not None:
+                    model_kwargs["position_ids"] = position_ids[:, past_length:current_length]
+                else:
+                    model_kwargs["position_ids"] = model_kwargs["cache_position"].unsqueeze(0)
             model_inputs = self.prepare_inputs_for_generation(input_chunk, **model_kwargs)
-
+            model_inputs["logits_to_keep"] = 1 if cid == len(input_chunks) - 1 else 0
+            
             outputs = self(**model_inputs, return_dict=True)
             if "mamba" in self.__class__.__name__.lower():
                 model_kwargs["cache_params"] = outputs.cache_params

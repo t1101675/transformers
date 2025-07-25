@@ -923,6 +923,7 @@ class Gemma2ForCausalLM(Gemma2PreTrainedModel, GenerationMixin):
         
         if (
             isinstance(past_key_values, HybridCache)
+            and attention_mask is not None
             and attention_mask.ndim == 2
             and not self.config._attn_implementation == "flash_attention_2"
         ):

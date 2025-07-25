@@ -3448,6 +3448,7 @@ class GenerationMixin:
 
         if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
             prefill_time, decode_time = 0, 0
+            model_kwargs.pop("attention_mask")
 
         if generation_config.prefill_chunk_size is not None:
             if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
@@ -5040,6 +5041,9 @@ class GenerationMixin:
                     model_kwargs["position_ids"] = position_ids[:, past_length:current_length]
                 else:
                     model_kwargs["position_ids"] = model_kwargs["cache_position"].unsqueeze(0)
+            else:
+                if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+                    model_kwargs["position_ids"] = None
             model_inputs = self.prepare_inputs_for_generation(input_chunk, **model_kwargs)
             
             outputs = self(**model_inputs, return_dict=True)
@@ -5055,7 +5059,9 @@ class GenerationMixin:
                 pbar.update(1)
                 pbar.set_description(f"Prefilling {round(current_length/1024)}K/{round(input_ids.size(-1)/1024)}K. Mem: {torch.cuda.memory_allocated() / 1024**3:.2f}GB")
 
-        model_kwargs["attention_mask"] = attention_mask
+        if not os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            model_kwargs["attention_mask"] = attention_mask
+        
         model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + 1
         _ = model_kwargs.pop("position_ids", None)
 

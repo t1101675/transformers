@@ -377,6 +377,10 @@ class FalconH1Attention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        import os
+        if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            position_ids = kwargs.pop("position_ids")
+
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -387,6 +391,9 @@ class FalconH1Attention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
+
+        if os.environ.get("ELLM_BENCHMARK_MODE", "False") in ["True", "1", "true"]:
+            kwargs["position_ids"] = position_ids
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
